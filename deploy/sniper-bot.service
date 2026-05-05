@@ -1,0 +1,19 @@
+[Unit]
+Description=Sniper Bot — Solana pump.fun paper trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/noah/.openclaw/workspace/projects/sniper-bot
+ExecStart=/home/noah/.openclaw/workspace/projects/sniper-bot/target/release/sniper-bot
+EnvironmentFile=-/home/noah/.openclaw/workspace/projects/sniper-bot/secrets.env
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sniper-bot
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

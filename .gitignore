@@ -1,0 +1,11 @@
+/target
+/data
+/logs
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+state.json
+.env
+secrets.env
+config.local.toml

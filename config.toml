@@ -1,0 +1,37 @@
+# sniper-bot config — paper trading mode
+[trading]
+mode = "paper"                  # paper | live (live not implemented yet)
+starting_bankroll_usd = 500.0
+position_size_pct = 10.0        # % of current bankroll per trade
+take_profit_pct = 30.0
+stop_loss_pct = 15.0
+max_concurrent_positions = 5
+max_hold_seconds = 1800         # 30min hard exit if neither TP nor SL hit
+
+[scanner]
+scan_interval_seconds = 15
+position_check_interval_seconds = 10
+heartbeat_interval_seconds = 300
+
+[filters]
+# Sanity filters on pump.fun firehose
+min_initial_liquidity_usd = 2000.0
+require_mint_renounced = true
+require_no_freeze_authority = true
+max_top10_holder_pct = 80.0
+min_token_age_seconds = 0       # 0 = brand new ok
+max_token_age_seconds = 60      # only snipe within 60s of launch
+
+[rpc]
+helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=PUBLIC"
+jupiter_quote_url = "https://quote-api.jup.ag/v6/quote"
+pumpportal_ws = "wss://pumpportal.fun/api/data"
+
+[telegram]
+# Set via env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+enabled = true
+
+[storage]
+db_path = "data/sniper.db"
+state_path = "data/state.json"
+log_dir = "logs"
