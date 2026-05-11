@@ -501,6 +501,55 @@ async fn handle_new_token(
         return Ok(());
     }
 
+    // 🛡️ Phase 3 Feature.1: pre-buy exit-slippage gate.
+    // Applies in BOTH paper AND live mode so paper validation exercises the
+    // same filter pipeline as live. Estimates the slippage of selling our
+    // hypothetical position back into the CURRENT curve depth (worst-
+    // realistic-exit model: assume other sellers have undone our buy's
+    // upward push by exit time). If the estimate exceeds the configured
+    // threshold, refuse. Closes the May 11 JOHNPORK failure where we'd lose
+    // -66% on a +80% curve trigger because curve depth couldn't absorb our
+    // exit.
+    if cfg.trading.pre_buy_slippage_required {
+        let curve = crate::bonding_curve::CurveState {
+            v_sol, v_tokens, last_update_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let probe_sol = cfg.trading.position_size_sol;
+        match curve.estimate_roundtrip_slippage(
+            probe_sol, cfg.trading.pre_buy_fee_bps_per_side,
+        ) {
+            None => {
+                let reason = "pre_exit_slippage_uncomputable";
+                warn!(mint=%tok.mint, v_sol, v_tokens, "⚠️ pre-buy slippage estimate returned None — refusing entry");
+                let _ = db.record_rejection(&tok.mint, reason);
+                return Ok(());
+            }
+            Some(estimated_slippage) => {
+                if estimated_slippage >= cfg.trading.pre_buy_slippage_threshold_pct {
+                    let reason = format!(
+                        "pre_exit_slippage_too_high {:.1}% ≥ {:.1}%",
+                        estimated_slippage * 100.0,
+                        cfg.trading.pre_buy_slippage_threshold_pct * 100.0,
+                    );
+                    info!(
+                        mint=%tok.mint, symbol=%tok.symbol,
+                        estimated_slippage_pct=%format!("{:.2}", estimated_slippage * 100.0),
+                        threshold_pct=%format!("{:.2}", cfg.trading.pre_buy_slippage_threshold_pct * 100.0),
+                        v_sol, v_tokens,
+                        "❌ pre-buy slippage too high — entry refused"
+                    );
+                    let _ = db.record_rejection(&tok.mint, &reason);
+                    return Ok(());
+                }
+                info!(
+                    mint=%tok.mint,
+                    estimated_slippage_pct=%format!("{:.2}", estimated_slippage * 100.0),
+                    "✅ pre-buy slippage OK"
+                );
+            }
+        }
+    }
+
     let symbol = if tok.symbol.is_empty() { tok.name.clone() } else { tok.symbol.clone() };
 
     let pos = match executor {
@@ -519,53 +568,6 @@ async fn handle_new_token(
                 );
                 let _ = db.record_rejection(&tok.mint, "live_position_cap_exceeded");
                 return Ok(());
-            }
-
-            // 🛡️ Phase 3 Feature.1: pre-buy exit-slippage gate.
-            // Estimate the slippage of selling our hypothetical position back
-            // into the CURRENT curve depth (worst-realistic-exit model:
-            // assume other sellers have undone our buy's upward push by exit
-            // time). If the estimate exceeds the configured threshold, refuse.
-            // Closes the May 11 JOHNPORK failure where we'd lose -66% on a
-            // +80% curve trigger because curve depth couldn't absorb our exit.
-            if cfg.trading.pre_buy_slippage_required {
-                let curve = crate::bonding_curve::CurveState {
-                    v_sol, v_tokens, last_update_ms: chrono::Utc::now().timestamp_millis(),
-                };
-                match curve.estimate_roundtrip_slippage(
-                    cfg.trading.position_size_sol,
-                    cfg.trading.pre_buy_fee_bps_per_side,
-                ) {
-                    None => {
-                        let reason = "pre_exit_slippage_uncomputable";
-                        warn!(mint=%tok.mint, v_sol, v_tokens, "⚠️ pre-buy slippage estimate returned None — refusing entry");
-                        let _ = db.record_rejection(&tok.mint, reason);
-                        return Ok(());
-                    }
-                    Some(estimated_slippage) => {
-                        if estimated_slippage >= cfg.trading.pre_buy_slippage_threshold_pct {
-                            let reason = format!(
-                                "pre_exit_slippage_too_high {:.1}% ≥ {:.1}%",
-                                estimated_slippage * 100.0,
-                                cfg.trading.pre_buy_slippage_threshold_pct * 100.0,
-                            );
-                            info!(
-                                mint=%tok.mint, symbol=%tok.symbol,
-                                estimated_slippage_pct=%format!("{:.2}", estimated_slippage * 100.0),
-                                threshold_pct=%format!("{:.2}", cfg.trading.pre_buy_slippage_threshold_pct * 100.0),
-                                v_sol, v_tokens,
-                                "❌ pre-buy slippage too high — entry refused"
-                            );
-                            let _ = db.record_rejection(&tok.mint, &reason);
-                            return Ok(());
-                        }
-                        info!(
-                            mint=%tok.mint,
-                            estimated_slippage_pct=%format!("{:.2}", estimated_slippage * 100.0),
-                            "✅ pre-buy slippage OK"
-                        );
-                    }
-                }
             }
 
             // Mark in-flight
