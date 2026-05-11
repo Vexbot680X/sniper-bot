@@ -112,6 +112,36 @@ pub struct Trading {
     /// a 0 ratio is treated as match. Default 5%.
     #[serde(default = "default_reconciliation_tolerance")]
     pub reconciliation_tolerance_pct: f64,
+
+    /// FEATURE (Phase 3.Feature.1): pre-buy exit-slippage gate.
+    /// When enabled, before any LIVE buy the bot estimates the slippage of
+    /// selling the bought tokens back into the CURRENT curve (modeling: by exit
+    /// time, other sellers have undone our buy's upward push — worst-realistic
+    /// case). If the estimate exceeds `pre_buy_slippage_threshold_pct`, the
+    /// entry is refused.
+    ///
+    /// Closes the May 11 JOHNPORK failure where TP fired at curve +79.97% but
+    /// realized fill was -66.22% — because we were 30-50% of curve depth at
+    /// $3-3.5k mcap. Setting `pre_buy_slippage_threshold_pct = 0.10` and
+    /// `position_size_sol = 0.005` ensures we only enter tokens whose curve
+    /// depth can absorb our exit cleanly.
+    ///
+    /// Refusal is logged as `pre_exit_slippage_too_high` in the DB rejections
+    /// table for later analysis.
+    ///
+    /// Default ON in live mode, threshold 10% (`0.10`).
+    #[serde(default = "default_pre_buy_slippage_required")]
+    pub pre_buy_slippage_required: bool,
+
+    /// Threshold for `pre_buy_slippage_required`. Estimated exit slippage must
+    /// be < this fraction to allow the entry. Default 0.10 (10%).
+    #[serde(default = "default_pre_buy_slippage_threshold")]
+    pub pre_buy_slippage_threshold_pct: f64,
+
+    /// Pump.fun swap fee (basis points per side). Used by the pre-buy slippage
+    /// estimator. Pump.fun's documented fee is 100 bps = 1% per side.
+    #[serde(default = "default_pre_buy_fee_bps")]
+    pub pre_buy_fee_bps_per_side: u16,
 }
 
 fn default_slippage_bps() -> u16 { 200 }
@@ -119,6 +149,9 @@ fn default_priority_fee_percentile() -> u8 { 75 }
 fn default_live_max_position_sol() -> f64 { 0.01 }
 fn default_reconciliation_required() -> bool { true }
 fn default_reconciliation_tolerance() -> f64 { 0.05 }
+fn default_pre_buy_slippage_required() -> bool { true }
+fn default_pre_buy_slippage_threshold() -> f64 { 0.10 }
+fn default_pre_buy_fee_bps() -> u16 { 100 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scanner {

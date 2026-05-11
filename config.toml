@@ -10,14 +10,17 @@ slippage_bps = 1500             # 15% slippage — raised from 500 on 2026-05-10
 priority_fee_percentile = 75    # 75th percentile of recent priority fees
 # Fixed position size in SOL. Always sized at this many SOL converted to USD
 # at decision time using current sol_usd. When > 0, overrides position_size_pct.
-position_size_sol = 0.01        # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — 0.01 SOL/trade (~$0.94) for band-scalp test. 9 attempts on $8.45 wallet.
+# 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
+# to 0.005 per PHASE_3_PLAN.md — smaller positions = smaller fee drag relative
+# to rug-detection edge, AND smaller blast radius for any safety feature bug.
+position_size_sol = 0.005       # ~$0.47 per trade @ $95/SOL
 position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
 
 # 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
 # The bot refuses any LIVE buy that would exceed this many SOL, regardless of
 # what position_size_sol or any other math says. Paper mode ignores this.
 # Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
-live_max_position_sol = 0.01    # 🛑 STRATEGY v4 2026-05-10 22:30 UTC — matches position_size_sol.
+live_max_position_sol = 0.005   # 🛑 STRATEGY v5 2026-05-11 — matches position_size_sol.
 take_profit_pct = 30.0           # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — +33% mcap target ($3k→$4k entry band).
 stop_loss_pct = 5.0              # 🔒 STRATEGY v3 2026-05-10 17:51 UTC — lowered from 10 to cut losers FAST. Better -8% real fill than -35% timeout.
 max_concurrent_positions = 5
@@ -26,6 +29,21 @@ max_hold_seconds = 30           # 🔒 STRATEGY v4 — 30s hold per Mamba spec.
 # USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
 rug_exit_mcap_usd = 2900.0       # 🔒 LIVE BOT RULES — exit if mcap drops below $2.9k (raised 2026-05-10 16:32 UTC by Mamba). Tighter rug-out to cut losers earlier.
 rug_exit_mcap_sol = 0.0         # legacy SOL floor, disabled when rug_exit_mcap_usd > 0
+
+# 🛡️ SAFETY (Phase 3.Safety.1): book↔chain reconciliation guard.
+# Refuses live startup if state.json book total disagrees with on-chain
+# balance by more than `reconciliation_tolerance_pct`. Auto-skipped on
+# paper mode, fresh state, or when open positions exist.
+reconciliation_required = true
+reconciliation_tolerance_pct = 0.05    # 5%
+
+# 🛡️ FEATURE (Phase 3.Feature.1): pre-buy exit-slippage gate.
+# Estimates the slippage of selling our position back into the CURRENT
+# curve depth (worst-realistic-exit model). Refuses entries where the
+# estimate exceeds the threshold. Closes the JOHNPORK-style failure.
+pre_buy_slippage_required = true
+pre_buy_slippage_threshold_pct = 0.10  # 10% — refuse if estimated >= this
+pre_buy_fee_bps_per_side = 100         # pump.fun documented swap fee
 
 [skim]
 # Continuous profit skim: on every winning close, move skim_pct of the realized
