@@ -1,11 +1,28 @@
+# Build / runtime artifacts
 /target
 /data
 /logs
+/debug
+
+# Local-only backups of config/state/code. Never committed.
+/backups
+
+# Secrets — never commit. Live keys live in secrets/ in the workspace root,
+# outside this repo. The env files below are the bot's runtime-loaded secrets.
+.env
+.env.*
+secrets.env
+config.local.toml
+
+# Database files (live in /data, but belt-and-suspenders)
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
+
+# Local state snapshots
 state.json
-.env
-secrets.env
-config.local.toml
+
+# In-tree backup files (anywhere in the tree)
+*.bak
+*.bak.*
