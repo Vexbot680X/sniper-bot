@@ -34,7 +34,7 @@ fn normalize_symbol(s: &str) -> String { s.trim().to_uppercase() }
 fn is_live(cfg: &Config) -> bool { cfg.trading.mode.eq_ignore_ascii_case("live") }
 
 /// Run-time options passed in from the CLI.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct RunOpts {
     /// If true: skip new-token listener, force-close every open position at
     /// market (ignoring TP/SL/timeout), then exit. Live-mode only — paper mode
@@ -43,6 +43,64 @@ pub struct RunOpts {
     /// SAFETY: if true, skip the live-mode reconciliation guard for this run.
     /// Logged loudly. Use sparingly; the guard is here for a reason.
     pub skip_reconcile: bool,
+    /// SAFETY (Phase 3 Safety.2): operator confirmation phrase for live mode.
+    /// Required to start when config mode = live. The expected phrase embeds
+    /// the trading wallet pubkey + the live_max_position_sol cap currently in
+    /// config, so a stale saved invocation cannot resurrect an old cap.
+    /// Paper mode ignores this entirely.
+    pub confirm_live: Option<String>,
+}
+
+/// Build the canonical live-confirmation phrase.
+/// The phrase embeds the trading wallet pubkey + the current live_max_position_sol
+/// cap so a stale saved invocation cannot resurrect an old cap. The comparison
+/// is strict (case-sensitive everywhere) AFTER whitespace normalization —
+/// the operator must copy-paste exactly what the bot printed. This prevents
+/// approximation drift (e.g. accidentally rounding 0.005 to 0.01).
+pub fn live_confirm_phrase(trading_pubkey: &str, max_position_sol: f64) -> String {
+    format!(
+        "I confirm LIVE trading on wallet {} with max position {} SOL",
+        trading_pubkey,
+        format_position_sol(max_position_sol),
+    )
+}
+
+/// Format SOL for the confirmation phrase. Uses a fixed canonical representation
+/// so that 0.005 and 0.00500 don't disagree, but small/large numbers still print
+/// cleanly. 6 fractional digits, trailing zeros trimmed.
+fn format_position_sol(sol: f64) -> String {
+    let s = format!("{:.6}", sol);
+    // Trim trailing zeros and dangling decimal point
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() }
+}
+
+/// Verify the user-supplied confirmation phrase matches the expected one for
+/// the current wallet + cap. Whitespace is normalized (any run of whitespace
+/// counts as a single space). Returns Err with a descriptive message if no
+/// match (or if no phrase was supplied).
+pub fn check_live_confirmation(
+    supplied: Option<&str>,
+    trading_pubkey: &str,
+    max_position_sol: f64,
+) -> Result<()> {
+    fn normalize(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let expected = live_confirm_phrase(trading_pubkey, max_position_sol);
+    let Some(supplied) = supplied else {
+        anyhow::bail!(
+            "🔴 LIVE MODE REQUIRES CONFIRMATION. Re-run with:\n\n  --confirm-live=\"{}\"\n\n\
+The phrase must match exactly (the wallet pubkey + position cap embedded above are derived from the current config).",
+            expected,
+        );
+    };
+    if normalize(supplied) == normalize(&expected) { return Ok(()); }
+    anyhow::bail!(
+        "🔴 LIVE CONFIRMATION PHRASE MISMATCH.\n  expected: {expected}\n  supplied: {supplied}\n\
+The phrase must match exactly (case-sensitive on pubkey + number; whitespace collapsed). \
+If the cap changed, regenerate the phrase from the value currently in `trading.live_max_position_sol`."
+    )
 }
 
 fn is_halted() -> bool { Path::new(HALT_FLAG).exists() }
@@ -108,8 +166,32 @@ pub async fn run_with_opts(cfg: Config, opts: RunOpts) -> Result<()> {
         }
         let rpc = Rpc::from_env(&cfg.rpc.helius_endpoint)?;
         let ex = Arc::new(Executor::new(&cfg, rpc)?);
-        // LIVE startup banner — log + alert wallet info + balances.
         let trading_pk = ex.trading_kp.pubkey();
+
+        // 🛡️ SAFETY (Phase 3.Safety.2): live-mode confirmation gate.
+        // Fires BEFORE any wallet balance fetch / banner / reconciliation /
+        // network activity. The phrase embeds the current trading wallet
+        // pubkey + live_max_position_sol cap so a stale saved invocation
+        // cannot resurrect an old cap. Paper mode never reaches this branch.
+        let trading_pk_str = trading_pk.to_string();
+        if let Err(e) = check_live_confirmation(
+            opts.confirm_live.as_deref(),
+            &trading_pk_str,
+            cfg.trading.live_max_position_sol,
+        ) {
+            error!(error=%e, "🔴 START REFUSED — live confirmation phrase required or mismatched");
+            // Single Telegram alert with the expected phrase so the operator can copy it.
+            let expected = live_confirm_phrase(&trading_pk_str, cfg.trading.live_max_position_sol);
+            tg.send(&format!(
+                "🔴 *LIVE CONFIRMATION REQUIRED*\nRe-run with:\n\n```\n--confirm-live=\"{}\"\n```\n\n\
+Wallet `{}`  cap `{} SOL`",
+                expected, trading_pk_str, format_position_sol(cfg.trading.live_max_position_sol)
+            )).await.ok();
+            anyhow::bail!(e);
+        }
+        info!(%trading_pk, "✅ live confirmation phrase accepted");
+
+        // LIVE startup banner — log + alert wallet info + balances.
         let trading_bal = ex.sol_balance_lamports().await.unwrap_or(0) as f64 / 1e9;
         let vault_bal = ex.vault_balance_lamports().await.unwrap_or(0) as f64 / 1e9;
 
@@ -794,5 +876,86 @@ async fn check_depletion_alert(cfg: &Config, state: &Mutex<State>, tg: &Telegram
         let mut s = state.lock().await;
         s.depletion_alert_sent = false;
         let _ = s.save(&cfg.storage.state_path);
+    }
+}
+
+
+#[cfg(test)]
+mod live_confirmation_tests {
+    use super::*;
+
+    const PK: &str = "6vKnymALQDriaeQ6pFbSvQvMArEUmUL5BVVmvQieedtY";
+
+    #[test]
+    fn phrase_includes_pubkey_and_cap() {
+        let p = live_confirm_phrase(PK, 0.005);
+        assert!(p.contains(PK), "phrase contains pubkey: {p}");
+        assert!(p.contains("0.005"), "phrase contains cap: {p}");
+        assert!(p.contains("LIVE"), "phrase contains LIVE: {p}");
+    }
+
+    #[test]
+    fn format_position_sol_trims_zeros() {
+        assert_eq!(format_position_sol(0.005), "0.005");
+        assert_eq!(format_position_sol(0.01), "0.01");
+        assert_eq!(format_position_sol(0.1), "0.1");
+        assert_eq!(format_position_sol(1.0), "1");
+        assert_eq!(format_position_sol(0.005000), "0.005");
+    }
+
+    #[test]
+    fn missing_phrase_is_rejected_with_helpful_message() {
+        let err = check_live_confirmation(None, PK, 0.005).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("--confirm-live"), "err mentions the flag: {msg}");
+        assert!(msg.contains(PK), "err prints the pubkey: {msg}");
+        assert!(msg.contains("0.005"), "err prints the cap: {msg}");
+    }
+
+    #[test]
+    fn matching_phrase_is_accepted() {
+        let phrase = live_confirm_phrase(PK, 0.005);
+        assert!(check_live_confirmation(Some(&phrase), PK, 0.005).is_ok());
+    }
+
+    #[test]
+    fn whitespace_is_normalized() {
+        let phrase = live_confirm_phrase(PK, 0.005);
+        // Add extra spaces between every word, plus leading/trailing whitespace,
+        // plus a tab and a newline inside one of the runs of spaces.
+        // Normalization collapses any whitespace run to one space.
+        let messy = phrase
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" \t  \n  ");
+        let messy = format!("\n\t  {messy}   \n");
+        assert!(check_live_confirmation(Some(&messy), PK, 0.005).is_ok(),
+                "whitespace-noisy phrase should match: {messy:?}");
+    }
+
+    #[test]
+    fn wrong_cap_is_rejected() {
+        let phrase_for_0_005 = live_confirm_phrase(PK, 0.005);
+        // Operator's saved invocation used 0.005 phrase but config now caps 0.01
+        // → mismatch, should refuse, protecting against stale-cap rerun.
+        let err = check_live_confirmation(Some(&phrase_for_0_005), PK, 0.01).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("MISMATCH"), "err describes mismatch: {msg}");
+    }
+
+    #[test]
+    fn wrong_pubkey_is_rejected() {
+        let phrase = live_confirm_phrase(PK, 0.005);
+        let other_pk = "CcDr8rSE5FcZmYsiUJUThUUNC7QUvE5rmUZD93rx51XD";
+        // Operator points at a different wallet than the phrase covers → refuse.
+        let err = check_live_confirmation(Some(&phrase), other_pk, 0.005).unwrap_err();
+        assert!(format!("{err}").contains("MISMATCH"));
+    }
+
+    #[test]
+    fn typo_is_rejected() {
+        let phrase = live_confirm_phrase(PK, 0.005);
+        let typoed = phrase.replace("confirm", "comfirm"); // sneaky typo
+        assert!(check_live_confirmation(Some(&typoed), PK, 0.005).is_err());
     }
 }

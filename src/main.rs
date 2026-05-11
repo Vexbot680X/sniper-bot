@@ -40,13 +40,30 @@ struct Cli {
     /// A loud warning is logged. Has no effect in paper mode.
     #[arg(long)]
     skip_reconcile: bool,
+
+    /// SAFETY (Phase 3 Safety.2): live-mode confirmation phrase.
+    /// Required to start the bot when `trading.mode = "live"` in config.
+    /// Must match the auto-derived phrase printed at startup if missing
+    /// (which embeds the trading wallet pubkey + live_max_position_sol cap),
+    /// so an old saved invocation cannot resurrect a stale cap.
+    /// Paper mode ignores this flag.
+    ///
+    /// Example: --confirm-live="I confirm LIVE trading on wallet 6vKny... with max position 0.005 SOL"
+    #[arg(long, value_name = "PHRASE")]
+    confirm_live: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    info!(force_exit_all = cli.force_exit_all, config = %cli.config, "⚡ sniper-bot starting up");
+    info!(
+        force_exit_all = cli.force_exit_all,
+        skip_reconcile = cli.skip_reconcile,
+        confirm_live_set = cli.confirm_live.is_some(),
+        config = %cli.config,
+        "⚡ sniper-bot starting up"
+    );
 
     let cfg = config::load(&cli.config)?;
     info!(?cfg.trading, "config loaded");
@@ -54,6 +71,7 @@ async fn main() -> Result<()> {
     let opts = daemon::RunOpts {
         force_exit_all: cli.force_exit_all,
         skip_reconcile: cli.skip_reconcile,
+        confirm_live: cli.confirm_live,
     };
     if let Err(e) = daemon::run_with_opts(cfg, opts).await {
         error!(error = ?e, "daemon exited with error");
