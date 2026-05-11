@@ -1,30 +1,82 @@
 # sniper-bot config — paper trading mode
 [trading]
-mode = "paper"                  # paper | live (live not implemented yet)
+mode = "live"                   # paper | live  — flipped LIVE 2026-05-10 13:33 UTC by Mamba on Helius Developer tier upgrade. Paper run history: 929 trades, +$2,133, 32% WR. May 9 live attempt: 5/5 timeouts, -$208 on free Helius. New attempt with Developer tier + safer position cap (0.05 SOL = ~$4.50/trade).
+# Live execution requires SNIPER_WALLET_PATH (default ~/.openclaw/workspace/secrets/sniper-bot-wallet.json)
+# and VAULT_WALLET_PATH (default ~/.openclaw/workspace/secrets/vault-wallet.json) plus HELIUS_API_KEY env vars.
+# DO NOT flip to live without reviewing LIVE_BUILD_REPORT.md and dust-testing first.
 starting_bankroll_usd = 500.0
-position_size_pct = 10.0        # % of current bankroll per trade
-take_profit_pct = 30.0
-stop_loss_pct = 15.0
+# LIVE-mode tx params (ignored in paper mode):
+slippage_bps = 1500             # 15% slippage — raised from 500 on 2026-05-10 17:51 UTC. Strategy v3: ACCEPT worse fills so we can ESCAPE positions before crowd dumps curve. Sell-side slippage was eating 50-80% of curve gains; tolerating worse fills is better than getting trapped in -35% TP exits.
+priority_fee_percentile = 75    # 75th percentile of recent priority fees
+# Fixed position size in SOL. Always sized at this many SOL converted to USD
+# at decision time using current sol_usd. When > 0, overrides position_size_pct.
+position_size_sol = 0.01        # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — 0.01 SOL/trade (~$0.94) for band-scalp test. 9 attempts on $8.45 wallet.
+position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
+
+# 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
+# The bot refuses any LIVE buy that would exceed this many SOL, regardless of
+# what position_size_sol or any other math says. Paper mode ignores this.
+# Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
+live_max_position_sol = 0.01    # 🛑 STRATEGY v4 2026-05-10 22:30 UTC — matches position_size_sol.
+take_profit_pct = 30.0           # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — +33% mcap target ($3k→$4k entry band).
+stop_loss_pct = 5.0              # 🔒 STRATEGY v3 2026-05-10 17:51 UTC — lowered from 10 to cut losers FAST. Better -8% real fill than -35% timeout.
 max_concurrent_positions = 5
-max_hold_seconds = 1800         # 30min hard exit if neither TP nor SL hit
+max_hold_seconds = 30           # 🔒 STRATEGY v4 — 30s hold per Mamba spec.
+# Rug exit: if open position's mcap collapses below this, force-close.
+# USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
+rug_exit_mcap_usd = 2900.0       # 🔒 LIVE BOT RULES — exit if mcap drops below $2.9k (raised 2026-05-10 16:32 UTC by Mamba). Tighter rug-out to cut losers earlier.
+rug_exit_mcap_sol = 0.0         # legacy SOL floor, disabled when rug_exit_mcap_usd > 0
+
+[skim]
+# Continuous profit skim: on every winning close, move skim_pct of the realized
+# gain to a sidelined `vault_usd` balance. Vault is one-way — never withdrawn back
+# into trading bankroll. Telegram alerts on each skim and on bankroll depletion.
+enabled = true
+skim_pct = 50.0
+# Alert when trading bankroll < (depletion_concurrent_floor * position_size_sol * sol_usd).
+# E.g. 5 → alert when bankroll can't fill all 5 concurrent slots.
+depletion_concurrent_floor = 5.0
 
 [scanner]
-scan_interval_seconds = 15
-position_check_interval_seconds = 10
+scan_interval_seconds = 10
+position_check_interval_seconds = 2     # 🔒 STRATEGY v3 2026-05-10 17:51 UTC — 5x faster polling (was 10s). Critical for catching exits before crowd.
 heartbeat_interval_seconds = 300
 
 [filters]
-# Sanity filters on pump.fun firehose
-min_initial_liquidity_usd = 2000.0
+# Sanity filters on pump.fun firehose.
+# Pump.fun launches all start with ~30 SOL virtual liquidity, so liquidity is
+# meaningless at launch — market cap is the real selectivity lever.
+# Graduation to Raydium happens ~460 SOL mcap (~$69k). Tier guide:
+#   50  SOL  (~$7.5k)  — early but filters deadest launches
+#   200 SOL  (~$30k)   — proven momentum, halfway to graduation
+#   460 SOL  (~$69k)   — graduation candidates only
+# Mcap floor: USD-denominated takes precedence when set; bot converts to SOL
+# at decision time using current sol_usd — always self-consistent.
+min_market_cap_usd = 3000.0      # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — band-scalp entry FLOOR ($3k).
+max_market_cap_usd = 3500.0      # 🔒 STRATEGY v4 — band-scalp entry CEILING ($3.5k). Only buy in $3k-$3.5k mcap band.
+min_market_cap_sol = 0.0        # legacy SOL floor, disabled when min_market_cap_usd > 0
 require_mint_renounced = true
 require_no_freeze_authority = true
 max_top10_holder_pct = 80.0
 min_token_age_seconds = 0       # 0 = brand new ok
-max_token_age_seconds = 60      # only snipe within 60s of launch
+max_token_age_seconds = 180     # extended from 60 → 180s on 2026-05-10 17:32 UTC. Strategy experiment: wider window to include tokens that survived first minute (more proven, less rug risk). Paper data was 0-60s only — this is uncharted.
+
+# Mayhem mode = pump.fun's optional 24h AI-driven market-maker mode (doubles
+# supply to 2B, AI agent randomly buys/sells the other 1B). Volatile, unpredictable,
+# not a fit for our 5min strategy. PumpPortal WS event has `is_mayhem_mode` flag
+# that we check directly.
+reject_mayhem_mode = true        # 🔒 LIVE BOT RULES — skip mayhem-mode launches
 
 [rpc]
+# Endpoint resolved at runtime by src/rpc.rs:
+#  1. If HELIUS_API_KEY env var is set, that key is used (preferred).
+#  2. Otherwise, if this string contains "api-key=..." and not "PUBLIC",
+#     it's used verbatim (local-only override).
+#  3. Otherwise, falls back to public mainnet RPC (logs a warning).
+# Keep the literal "PUBLIC" placeholder here so secrets never enter git history.
+# Set HELIUS_API_KEY in `secrets.env` for live operation.
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=PUBLIC"
-jupiter_quote_url = "https://quote-api.jup.ag/v6/quote"
+jupiter_quote_url = "https://lite-api.jup.ag/swap/v1/quote"  # updated 2026-05-10 — old quote-api.jup.ag/v6/quote returns HTTP 000, Jupiter migrated to lite-api.jup.ag/swap/v1. Was silently falling back to $90 SOL_USD const.
 pumpportal_ws = "wss://pumpportal.fun/api/data"
 
 [telegram]

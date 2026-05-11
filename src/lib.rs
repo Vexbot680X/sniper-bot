@@ -1,0 +1,15 @@
+//! Library surface for `sniper-bot`. Exposes only the modules the
+//! integration tests under `tests/` need to reach.
+
+pub mod config;
+pub mod executor;
+pub mod pump_ix;
+pub mod pumpportal_trade;
+pub mod rpc;
+pub mod state;
+pub mod storage;
+pub mod wallet;
+
+// `executor` references `crate::pump_ix`, `crate::rpc`, `crate::wallet`, `crate::config`
+// — already present above. It also references `crate::positions` indirectly via no
+// imports, so we don't need to export the daemon/positions tree.

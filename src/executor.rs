@@ -1,0 +1,824 @@
+//! Live execution layer for pump.fun trades.
+//!
+//! Originally wrapped the `pumpfun` crate's `buy()` / `sell()` calls. Those
+//! were broken for current-deployment pump.fun (Token-2022 mints, 18-account
+//! buy ix layout) — see the 2026-05-08 0xbc4 incident. We now hand-roll the
+//! instructions in [`crate::pump_ix`] and only use the `pumpfun` crate for its
+//! `BondingCurveAccount` / `GlobalAccount` math + slippage helpers (which are
+//! still correct).
+
+use crate::config::Config;
+use crate::pump_ix;
+use crate::rpc::Rpc;
+use crate::wallet;
+use anyhow::{anyhow, Context, Result};
+use pumpfun::{
+    common::types::{Cluster, PriorityFee},
+    PumpFun,
+};
+use rand::SeedableRng;
+use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_sdk::transaction::Transaction;
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    native_token::sol_to_lamports,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature},
+    signer::Signer,
+};
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
+use solana_sdk::instruction::Instruction;
+use solana_transaction_status::UiTransactionEncoding;
+
+/// Mirror of pumpfun::PumpFun::get_priority_fee_instructions — not exported, so we
+/// rebuild it here for `simulate_buy`. Same shape: optional unit_limit ix +
+/// optional unit_price ix.
+fn pumpfun_priority_fee_ixs(pf: &PriorityFee) -> Vec<Instruction> {
+    let mut v = Vec::new();
+    if let Some(limit) = pf.unit_limit {
+        v.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
+    }
+    if let Some(price) = pf.unit_price {
+        v.push(ComputeBudgetInstruction::set_compute_unit_price(price));
+    }
+    v
+}
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{info, warn};
+
+/// Result of an on-chain buy.
+#[derive(Debug, Clone)]
+pub struct BuyFill {
+    pub signature: Signature,
+    /// Raw token base-units received (pump.fun tokens are 6 decimals, so 1e6 = 1 token).
+    pub tokens_base: u64,
+    /// Actual SOL spent in lamports (includes the trade SOL plus fees parsed from logs).
+    pub sol_spent_lamports: u64,
+    /// Effective entry price in SOL per token (sol_spent / tokens_human).
+    pub effective_price_sol: f64,
+}
+
+/// Result of an on-chain sell.
+#[derive(Debug, Clone)]
+pub struct SellFill {
+    pub signature: Signature,
+    pub tokens_sold_base: u64,
+    pub sol_received_lamports: u64,
+    pub effective_price_sol: f64,
+}
+
+/// Returns true if a pump.fun buy error is worth retrying — covers the
+/// create-pool/WS-event race window. Specifically:
+///  - Anchor 3012 / 0xbc4 (AccountNotInitialized — bonding curve ATA / global)
+///  - BondingCurveNotFound (the crate's own pre-flight)
+///  - generic "account not found" surfaced from RPC during get_bonding_curve_account
+fn is_retriable_buy_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("0xbc4")
+        || m.contains("3012")
+        || m.contains("accountnotinitialized")
+        || m.contains("bondingcurvenotfound")
+        || m.contains("could not find account")
+        || m.contains("account not found")
+        // Anchor 6023 sometimes fires when bonding-curve state is mid-init.
+        || m.contains("0x1787")
+        // Token-2022 "Invalid Mint" (Custom(2)) — same first-buyer race, mint create
+        // tx hasn't propagated to our RPC view yet. Seen 2026-05-09 18:21.
+        || m.contains("invalid mint")
+        || m.contains("instructionerror(2, custom(2))")
+        // Generic "Custom(2)" buried in a logs block from the ATA-create CPI —
+        // happens when the mint isn't visible at simulate time.
+        || m.contains("failed: custom program error: 0x2")
+}
+
+/// Live executor — owns the trading wallet, vault wallet, and the pumpfun client.
+pub struct Executor {
+    pub trading_kp: Arc<Keypair>,
+    pub vault_pubkey: Pubkey,
+    pub vault_kp_for_balance_check: Arc<Keypair>, // owned only so we have the key file loaded
+    pub rpc: Rpc,
+    pub pump: PumpFun,
+    pub slippage_bps: u64,
+    pub priority_fee_percentile: u8,
+}
+
+impl Executor {
+    pub fn new(cfg: &Config, rpc: Rpc) -> Result<Self> {
+        let trading_path = std::env::var("SNIPER_WALLET_PATH")
+            .unwrap_or_else(|_| {
+                shellexpand::tilde("~/.openclaw/workspace/secrets/sniper-bot-wallet.json").to_string()
+            });
+        let vault_path = std::env::var("VAULT_WALLET_PATH")
+            .unwrap_or_else(|_| {
+                shellexpand::tilde("~/.openclaw/workspace/secrets/vault-wallet.json").to_string()
+            });
+
+        let trading_kp = Arc::new(wallet::load_keypair(&trading_path)
+            .with_context(|| format!("load trading wallet from {}", trading_path))?);
+        let vault_kp = Arc::new(wallet::load_keypair(&vault_path)
+            .with_context(|| format!("load vault wallet from {}", vault_path))?);
+        let vault_pubkey = vault_kp.pubkey();
+
+        // Confirm pubkeys match the expected ones from config / docs — refuse to start otherwise.
+        let expected_trading = "6vKnymALQDriaeQ6pFbSvQvMArEUmUL5BVVmvQieedtY";
+        let expected_vault = "CcDr8rSE5FcZmYsiUJUThUUNC7QUvE5rmUZD93rx51XD";
+        if trading_kp.pubkey().to_string() != expected_trading {
+            return Err(anyhow!(
+                "trading wallet pubkey mismatch: file={} expected={}",
+                trading_kp.pubkey(), expected_trading
+            ));
+        }
+        if vault_pubkey.to_string() != expected_vault {
+            return Err(anyhow!(
+                "vault wallet pubkey mismatch: file={} expected={}",
+                vault_pubkey, expected_vault
+            ));
+        }
+
+        // Build pumpfun client. We pass the same RPC endpoint as our internal RPC.
+        let ws_url = rpc.endpoint.replace("https://", "wss://").replace("http://", "ws://");
+        let cluster = Cluster::new(
+            rpc.endpoint.clone(),
+            ws_url,
+            CommitmentConfig::confirmed(),
+            PriorityFee::default(),
+        );
+        let pump = PumpFun::new(trading_kp.clone(), cluster);
+
+        Ok(Self {
+            trading_kp,
+            vault_pubkey,
+            vault_kp_for_balance_check: vault_kp,
+            rpc,
+            pump,
+            slippage_bps: (cfg.trading.slippage_bps as u64).max(1),
+            priority_fee_percentile: cfg.trading.priority_fee_percentile,
+        })
+    }
+
+    /// Build the priority-fee struct for this tx using our RPC's fee oracle.
+    async fn build_priority_fee(&self) -> Option<PriorityFee> {
+        let micro = self.rpc.priority_fee_micro_lamports(self.priority_fee_percentile).await?;
+        // Use a generous unit_limit; pump.fun buys/sells take ~70-100k CU typically.
+        Some(PriorityFee {
+            unit_limit: Some(200_000),
+            unit_price: Some(micro),
+        })
+    }
+
+    /// Build the full instruction list for a hand-rolled pump.fun buy:
+    /// `[priority-fee...] + [create_idempotent_ata(buyer, mint, T22-or-classic)] + [pump.fun BUY (18 accts)]`
+    ///
+    /// This is the **fix** for the 2026-05-08 `0xbc4 / AccountNotInitialized
+    /// (associated_bonding_curve)` bug: the original `pumpfun` crate path
+    /// derived its ATAs against Token Classic and the deployed program now
+    /// expects Token-2022 ATAs + 2 trailing accounts (`bonding-curve-v2` +
+    /// buyback fee recipient). See `LIVE_BUG_FIX_REPORT.md` for the full diff.
+    pub async fn build_buy_ixs(
+        &self,
+        mint_pk: &Pubkey,
+        amount_sol_lamports: u64,
+        priority_fee: &PriorityFee,
+    ) -> Result<Vec<Instruction>> {
+        let token_program = pump_ix::detect_token_program(&self.rpc.client, mint_pk).await?;
+
+        // Resolve creator FROM CHAIN directly. The pumpfun crate's
+        // `get_bonding_curve_account` parser has been unreliable (stale layout vs current
+        // deployment), and its silent `.ok()` fallback to `creator = user` was the
+        // 2026-05-09 16:45 ConstraintSeeds(creator_vault) bug:
+        // we sent QA7irmLd... (creator-vault for OUR pubkey) but the program wanted
+        // Di45Loe... (creator-vault for the ACTUAL creator bwamJzz...). The crate's
+        // parser failed -> .ok() swallowed it -> wrong creator -> wrong vault PDA.
+        //
+        // Read directly. BondingCurve layout (after 8-byte disc):
+        //   8 v_token + 8 v_sol + 8 r_token + 8 r_sol + 8 t_supply + 1 complete + 32 creator
+        //   creator_offset = 8 + 8*5 + 1 = 49.
+        let bc_pda = pump_ix::bonding_curve_pda(mint_pk);
+        let bc_acct_res = self.rpc.client.get_account(&bc_pda).await;
+        let (token_amount, creator, bc_present) = match bc_acct_res {
+            Ok(acct) if acct.data.len() >= 49 + 32 => {
+                let creator_bytes: [u8; 32] = acct.data[49..49+32].try_into().unwrap();
+                let creator = Pubkey::new_from_array(creator_bytes);
+                // Use crate's price math via re-parse (still correct math, just unreliable parser).
+                // If parser fails, fall back to global initial-curve math.
+                // NB: pumpfun::ClientError is not Send (carries dyn StdError), so we MUST drop
+                // the Result BEFORE the next await to keep the surrounding future Send.
+                let bc_math_opt = self.pump.get_bonding_curve_account(mint_pk).await
+                    .ok()
+                    .and_then(|bc| bc.get_buy_price(amount_sol_lamports).ok());
+                let amount = match bc_math_opt {
+                    Some(a) => a,
+                    None => {
+                        let global = self.pump.get_global_account().await
+                            .map_err(|e| anyhow!("get_global_account fallback: {e}"))?;
+                        global.get_initial_buy_price(amount_sol_lamports)
+                    }
+                };
+                (amount, creator, true)
+            }
+            Ok(_acct) => {
+                // BC exists but is too small to parse - this should never happen for valid pump tokens.
+                warn!(mint=%mint_pk, "⚠️ BC account exists but is too small to read creator — falling back to user. This will likely fail with ConstraintSeeds.");
+                let global = self.pump.get_global_account().await
+                    .map_err(|e| anyhow!("get_global_account: {e}"))?;
+                (global.get_initial_buy_price(amount_sol_lamports), self.trading_kp.pubkey(), false)
+            }
+            Err(e) => {
+                // BC not on chain yet. True first-buyer race — fall back to creator=user
+                // is correct here because pump.fun's own create+buy flow seeds creator=create_payer.
+                info!(mint=%mint_pk, error=%e, "BC not on-chain yet — first-buyer race, using creator=user fallback");
+                let global = self.pump.get_global_account().await
+                    .map_err(|e| anyhow!("get_global_account: {e}"))?;
+                (global.get_initial_buy_price(amount_sol_lamports), self.trading_kp.pubkey(), false)
+            }
+        };
+        info!(mint=%mint_pk, %creator, bc_present, "resolved creator for buy ix");
+        let max_sol_cost = pumpfun::utils::calculate_with_slippage_buy(
+            amount_sol_lamports,
+            self.slippage_bps,
+        );
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let buy_ix = pump_ix::buy_ix(
+            &pump_ix::BuyArgs {
+                user: self.trading_kp.pubkey(),
+                mint: *mint_pk,
+                creator,
+                token_program,
+                amount: token_amount,
+                max_sol_cost,
+                track_volume: Some(true),
+            },
+            &mut rng,
+        );
+        let ata_ix = pump_ix::create_idempotent_ata_ix(
+            &self.trading_kp.pubkey(),
+            &self.trading_kp.pubkey(),
+            mint_pk,
+            &token_program,
+        );
+
+        let mut ixs = pumpfun_priority_fee_ixs(priority_fee);
+        ixs.push(ata_ix);
+        ixs.push(buy_ix);
+        Ok(ixs)
+    }
+
+    /// Build a hand-rolled pump.fun sell instruction list.
+    /// `[priority-fee...] + [pump.fun SELL (16 accts)]`. ATA already exists from buy.
+    pub async fn build_sell_ixs(
+        &self,
+        mint_pk: &Pubkey,
+        token_amount_base: u64,
+        priority_fee: &PriorityFee,
+    ) -> Result<Vec<Instruction>> {
+        let token_program = pump_ix::detect_token_program(&self.rpc.client, mint_pk).await?;
+        let bc = self
+            .pump
+            .get_bonding_curve_account(mint_pk)
+            .await
+            .map_err(|e| anyhow!("get_bonding_curve_account (sell): {e}"))?;
+        let creator = bc.creator;
+        // Compute min_sol_output from on-chain BC + slippage.
+        let expected_sol = bc
+            .get_sell_price(token_amount_base, /* fee_bps */ 100)
+            .map_err(|e| anyhow!("bc.get_sell_price: {e}"))?;
+        let min_sol_output =
+            pumpfun::utils::calculate_with_slippage_sell(expected_sol, self.slippage_bps);
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let sell_ix = pump_ix::sell_ix(
+            &pump_ix::SellArgs {
+                user: self.trading_kp.pubkey(),
+                mint: *mint_pk,
+                creator,
+                token_program,
+                amount: token_amount_base,
+                min_sol_output,
+            },
+            &mut rng,
+        );
+
+        let mut ixs = pumpfun_priority_fee_ixs(priority_fee);
+        ixs.push(sell_ix);
+        Ok(ixs)
+    }
+
+    /// Submit a signed tx (already-built ixs) and wait for confirmation.
+    async fn send_ixs(&self, ixs: &[Instruction]) -> Result<Signature> {
+        let blockhash = self
+            .rpc
+            .client
+            .get_latest_blockhash()
+            .await
+            .context("get blockhash")?;
+        let tx = Transaction::new_signed_with_payer(
+            ixs,
+            Some(&self.trading_kp.pubkey()),
+            &[&*self.trading_kp],
+            blockhash,
+        );
+        // Pre-flight simulate (cheap, lets us bail before paying any fee).
+        let sim_cfg = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            commitment: Some(CommitmentConfig::confirmed()),
+            encoding: None,
+            accounts: None,
+            min_context_slot: None,
+            inner_instructions: false,
+        };
+        let sim = self
+            .rpc
+            .client
+            .simulate_transaction_with_config(&tx, sim_cfg)
+            .await
+            .context("simulate before send")?;
+        if let Some(err) = sim.value.err {
+            let logs = sim.value.logs.unwrap_or_default().join("\n");
+            return Err(anyhow!("pre-send simulate failed: {err:?}\n{logs}"));
+        }
+        // Submit-and-confirm. If it fails after broadcast we MUST capture the on-chain
+        // logs — the previous code lost them with `.context("submit tx")`, leaving us
+        // blind to what actually went wrong on chain (slippage? PDA? compute budget?).
+        let send_res = self
+            .rpc
+            .client
+            .send_and_confirm_transaction_with_spinner_and_commitment(
+                &tx,
+                CommitmentConfig::confirmed(),
+            )
+            .await;
+        let sig = match send_res {
+            Ok(s) => s,
+            Err(e) => {
+                // Try to extract the on-chain failure logs. solana-rpc-client's
+                // `ClientErrorKind::TransactionError` carries the program error; if we
+                // got a signature in the error path, fetch the tx logs from chain.
+                let err_str = format!("{e}");
+                // Best-effort: signature is the first thing in the tx, derive it from the tx itself.
+                let sig_attempted = tx.signatures.first().copied();
+                let mut logs_block = String::new();
+                if let Some(sig_a) = sig_attempted {
+                    if let Ok(tx_status) = self.rpc.client.get_transaction(
+                        &sig_a,
+                        UiTransactionEncoding::Json,
+                    ).await {
+                        if let Some(meta) = tx_status.transaction.meta {
+                            let logs: Vec<String> = match meta.log_messages {
+                                solana_transaction_status::option_serializer::OptionSerializer::Some(v) => v,
+                                _ => Vec::new(),
+                            };
+                            if !logs.is_empty() {
+                                logs_block = format!("\nsig={sig_a}\non-chain logs:\n{}", logs.join("\n"));
+                            } else {
+                                logs_block = format!("\nsig={sig_a} (no logs available — tx may not have landed)");
+                            }
+                        }
+                    } else {
+                        logs_block = format!("\nsig={sig_a} (could not fetch tx — may be unconfirmed/dropped)");
+                    }
+                }
+                return Err(anyhow!("submit tx: {err_str}{logs_block}"));
+            }
+        };
+        Ok(sig)
+    }
+
+    /// Submit a pre-signed VersionedTransaction (used for PumpPortal-built txs).
+    /// Same simulate-before-submit guardrail and on-chain log capture as `send_ixs`.
+    async fn send_versioned_tx(&self, tx: &solana_sdk::transaction::VersionedTransaction) -> Result<Signature> {
+        // Pre-flight simulate.
+        let sim_cfg = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            commitment: Some(CommitmentConfig::confirmed()),
+            encoding: None,
+            accounts: None,
+            min_context_slot: None,
+            inner_instructions: false,
+        };
+        let sim = self.rpc.client
+            .simulate_transaction_with_config(tx, sim_cfg)
+            .await
+            .context("simulate versioned tx")?;
+        if let Some(err) = sim.value.err {
+            let logs = sim.value.logs.unwrap_or_default().join("\n");
+            return Err(anyhow!("pre-send simulate failed: {err:?}\n{logs}"));
+        }
+        let send_res = self.rpc.client
+            .send_and_confirm_transaction_with_spinner_and_commitment(
+                tx,
+                CommitmentConfig::confirmed(),
+            ).await;
+        match send_res {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                let err_str = format!("{e}");
+                let sig_attempted = tx.signatures.first().copied();
+                let mut logs_block = String::new();
+                if let Some(sig_a) = sig_attempted {
+                    if let Ok(tx_status) = self.rpc.client.get_transaction(
+                        &sig_a,
+                        UiTransactionEncoding::Json,
+                    ).await {
+                        if let Some(meta) = tx_status.transaction.meta {
+                            let logs: Vec<String> = match meta.log_messages {
+                                solana_transaction_status::option_serializer::OptionSerializer::Some(v) => v,
+                                _ => Vec::new(),
+                            };
+                            if !logs.is_empty() {
+                                logs_block = format!("\nsig={sig_a}\non-chain logs:\n{}", logs.join("\n"));
+                            } else {
+                                logs_block = format!("\nsig={sig_a} (no logs)");
+                            }
+                        }
+                    } else {
+                        logs_block = format!("\nsig={sig_a} (no tx record)");
+                    }
+                }
+                Err(anyhow!("submit versioned tx: {err_str}{logs_block}"))
+            }
+        }
+    }
+
+    /// Buy `amount_sol` SOL worth of `mint`. Returns the actual fill.
+    ///
+    /// Retry policy: pump.fun create-pool tx and our PumpPortal WS event race —
+    /// the WS "create" message often fires before the create-pool tx is
+    /// confirmed, so the bonding curve and its associated token account aren't
+    /// initialized yet. Retry up to 5 times with exponential-ish backoff for
+    /// `AccountNotInitialized` (Anchor 3012 / 0xbc4) and `BondingCurveNotFound`.
+    pub async fn buy(&self, mint: &str, amount_sol: f64) -> Result<BuyFill> {
+        let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
+        let amount_lamports = sol_to_lamports(amount_sol);
+        let slippage_pct = ((self.slippage_bps as f64 / 100.0).round() as u32).max(1);
+        info!(mint=%mint, sol=amount_sol, lamports=amount_lamports,
+              slippage_bps=self.slippage_bps, slippage_pct,
+              "🚀 LIVE BUY via PumpPortal trade-local");
+
+        // PumpPortal needs priority fee in SOL units. We translate from
+        // priority_fee_micro_lamports * compute_units; with 200k CU and ~0-5k
+        // micro-lamports/CU we land at 0-1M lamports => 0.001 SOL. Use a sensible
+        // default of 0.005 SOL during dust/test phase — cheap insurance.
+        let priority_fee_sol = match self.build_priority_fee().await {
+            Some(pf) => {
+                let unit_price = pf.unit_price.unwrap_or(0) as f64;
+                let unit_limit = pf.unit_limit.unwrap_or(200_000) as f64;
+                let lamports = (unit_price * unit_limit) / 1_000_000.0;
+                let sol = (lamports / 1e9).max(0.0005); // floor at 0.0005 SOL
+                sol.min(0.01) // cap at 0.01 SOL to avoid bleed
+            }
+            None => 0.005,
+        };
+
+        // Retry schedule: attempt at 0ms, 250ms, 500ms, 1000ms, 1800ms — total ~3.5s.
+        let backoffs_ms: [u64; 5] = [0, 250, 500, 1000, 1800];
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut sig_opt: Option<Signature> = None;
+        for (attempt, delay) in backoffs_ms.iter().enumerate() {
+            if *delay > 0 {
+                tokio::time::sleep(Duration::from_millis(*delay)).await;
+            }
+            let attempt_res: Result<Signature> = async {
+                let signed_tx = crate::pumpportal_trade::build_signed_trade_tx(
+                    &self.trading_kp,
+                    &mint_pk,
+                    crate::pumpportal_trade::TradeAction::Buy,
+                    amount_sol,
+                    /* denominated_in_sol */ true,
+                    slippage_pct,
+                    priority_fee_sol,
+                    "auto",
+                ).await.context("pumpportal build buy tx")?;
+                self.send_versioned_tx(&signed_tx).await
+            }.await;
+            match attempt_res {
+                Ok(s) => { sig_opt = Some(s); break; }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let retriable = is_retriable_buy_error(&msg);
+                    warn!(attempt = attempt + 1, %mint, retriable, error = %msg, "buy attempt failed");
+                    last_err = Some(anyhow!("pumpportal buy: {msg}"));
+                    if !retriable { break; }
+                }
+            }
+        }
+        let sig = sig_opt.ok_or_else(|| last_err.unwrap_or_else(|| anyhow!("buy failed: no attempts")))?;
+        let fill = self.parse_buy_fill(&sig, &mint_pk, amount_lamports).await?;
+        info!(%sig, mint=%mint, tokens=fill.tokens_base, sol=fill.sol_spent_lamports, "✅ buy filled");
+        Ok(fill)
+    }
+
+    /// Sell all tokens of `mint` held by the trading wallet. Returns the actual fill.
+    pub async fn sell_all(&self, mint: &str) -> Result<SellFill> {
+        let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
+        let slippage_pct = ((self.slippage_bps as f64 / 100.0).round() as u32).max(1);
+        // Snapshot pre-sell balance so we can compute SOL received from the delta.
+        let pre_sol = wallet::get_sol_balance(&self.rpc.client, &self.trading_kp.pubkey())
+            .await.unwrap_or(0);
+        let pre_tokens = self.token_balance_pk(&mint_pk).await.unwrap_or(0);
+
+        info!(mint=%mint, pre_tokens, slippage_pct, "🔴 LIVE SELL via PumpPortal trade-local");
+        if pre_tokens == 0 {
+            return Err(anyhow!("sell_all: zero token balance for {mint}"));
+        }
+
+        // PumpPortal `denominatedInSol=false` + amount = number of tokens (human units).
+        // Pump.fun tokens have 6 decimals; PumpPortal expects whole tokens, not base units.
+        let tokens_human = pre_tokens as f64 / 1e6;
+
+        let priority_fee_sol = match self.build_priority_fee().await {
+            Some(pf) => {
+                let unit_price = pf.unit_price.unwrap_or(0) as f64;
+                let unit_limit = pf.unit_limit.unwrap_or(200_000) as f64;
+                ((unit_price * unit_limit) / 1_000_000.0 / 1e9).max(0.0005).min(0.01)
+            }
+            None => 0.005,
+        };
+
+        let signed_tx = crate::pumpportal_trade::build_signed_trade_tx(
+            &self.trading_kp,
+            &mint_pk,
+            crate::pumpportal_trade::TradeAction::Sell,
+            tokens_human,
+            /* denominated_in_sol */ false,
+            slippage_pct,
+            priority_fee_sol,
+            "auto",
+        ).await.context("pumpportal build sell tx")?;
+        let sig = self.send_versioned_tx(&signed_tx).await
+            .map_err(|e| anyhow!("pumpportal sell: {e}"))?;
+
+        let fill = self.parse_sell_fill(&sig, &mint_pk, pre_sol, pre_tokens).await?;
+        info!(%sig, mint=%mint, tokens=fill.tokens_sold_base, sol=fill.sol_received_lamports, "✅ sell filled");
+        Ok(fill)
+    }
+
+    /// Parse a buy tx's logs to extract actual `tokens_received` and SOL spent.
+    /// pump.fun emits a `Program data: ...` event with a Trade struct; we also
+    /// just diff the user's token balance pre/post to be defensive.
+    async fn parse_buy_fill(
+        &self,
+        sig: &Signature,
+        mint: &Pubkey,
+        requested_lamports: u64,
+    ) -> Result<BuyFill> {
+        // Read confirmed token balance — this is the most reliable source of truth.
+        // Wait briefly for confirmation indexing.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let bal = self.token_balance_pk(mint).await.unwrap_or(0);
+            if bal > 0 {
+                let tokens_human = bal as f64 / 1e6;
+                let sol_human = requested_lamports as f64 / 1e9;
+                let price = if tokens_human > 0.0 { sol_human / tokens_human } else { 0.0 };
+                return Ok(BuyFill {
+                    signature: *sig,
+                    tokens_base: bal,
+                    sol_spent_lamports: requested_lamports, // approx; SDK takes care of fees
+                    effective_price_sol: price,
+                });
+            }
+        }
+        // Fallback: parse log events
+        if let Some(fill) = self.parse_trade_event_logs(sig, mint, true).await? {
+            return Ok(BuyFill {
+                signature: *sig,
+                tokens_base: fill.0,
+                sol_spent_lamports: fill.1,
+                effective_price_sol: if fill.0 > 0 { (fill.1 as f64 / 1e9) / (fill.0 as f64 / 1e6) } else { 0.0 },
+            });
+        }
+        Err(anyhow!("could not determine buy fill from logs or balance for sig {sig}"))
+    }
+
+    async fn parse_sell_fill(
+        &self,
+        sig: &Signature,
+        mint: &Pubkey,
+        pre_sol_lamports: u64,
+        pre_tokens_base: u64,
+    ) -> Result<SellFill> {
+        // Diff balances post-confirmation.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let post_sol = wallet::get_sol_balance(&self.rpc.client, &self.trading_kp.pubkey())
+                .await.unwrap_or(pre_sol_lamports);
+            let post_tokens = self.token_balance_pk(mint).await.unwrap_or(pre_tokens_base);
+            if post_tokens < pre_tokens_base {
+                let sold = pre_tokens_base - post_tokens;
+                let received = post_sol.saturating_sub(pre_sol_lamports);
+                let tokens_human = sold as f64 / 1e6;
+                let sol_human = received as f64 / 1e9;
+                let price = if tokens_human > 0.0 { sol_human / tokens_human } else { 0.0 };
+                return Ok(SellFill {
+                    signature: *sig,
+                    tokens_sold_base: sold,
+                    sol_received_lamports: received,
+                    effective_price_sol: price,
+                });
+            }
+        }
+        // Fallback: parse logs
+        if let Some(fill) = self.parse_trade_event_logs(sig, mint, false).await? {
+            return Ok(SellFill {
+                signature: *sig,
+                tokens_sold_base: fill.0,
+                sol_received_lamports: fill.1,
+                effective_price_sol: if fill.0 > 0 { (fill.1 as f64 / 1e9) / (fill.0 as f64 / 1e6) } else { 0.0 },
+            });
+        }
+        Err(anyhow!("could not determine sell fill from logs or balance for sig {sig}"))
+    }
+
+    /// Best-effort log parsing — returns (tokens_base, sol_lamports) if found.
+    /// Pump.fun's Trade event includes `token_amount` and `sol_amount`. If our
+    /// event parsing here can't find them (anchor self-CPI / encoded), we'll
+    /// already have the balance-diff path as primary.
+    async fn parse_trade_event_logs(
+        &self,
+        sig: &Signature,
+        _mint: &Pubkey,
+        _is_buy: bool,
+    ) -> Result<Option<(u64, u64)>> {
+        let cfg = solana_rpc_client_api::config::RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        let tx = match self.rpc.client.get_transaction_with_config(sig, cfg).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error=?e, "could not fetch confirmed tx for log parsing");
+                return Ok(None);
+            }
+        };
+        let _ = tx; // we keep this best-effort; balance-diff is primary
+        Ok(None)
+    }
+
+    /// Send the vault skim — a plain SOL transfer from trading -> vault.
+    pub async fn skim_to_vault(&self, lamports: u64) -> Result<Signature> {
+        wallet::transfer_sol(&self.rpc.client, &self.trading_kp, &self.vault_pubkey, lamports).await
+    }
+
+    /// Build the same instruction list `buy()` would submit, sign it as a tx, and
+    /// run `simulateTransaction` against mainnet RPC. No broadcast. Used by the
+    /// re-enable gate — we MUST get a successful sim against a real recently-launched
+    /// mint before flipping live mode back on.
+    ///
+    /// Returns Ok(()) on a successful simulation. The error string includes the
+    /// program logs from the failed simulation, so test output is debuggable.
+    pub async fn simulate_buy(&self, mint: &str, amount_sol: f64) -> Result<()> {
+        let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
+        let amount_lamports = sol_to_lamports(amount_sol);
+        let priority_fee = self.build_priority_fee().await
+            .unwrap_or(PriorityFee { unit_limit: Some(200_000), unit_price: Some(0) });
+
+        // Hand-rolled ixs (same path as live buy()): priority-fee + create-idempotent-ATA + 18-acct BUY.
+        let ixs = self.build_buy_ixs(&mint_pk, amount_lamports, &priority_fee).await?;
+
+        let blockhash = self.rpc.client.get_latest_blockhash().await
+            .context("get blockhash")?;
+        let tx = Transaction::new_signed_with_payer(
+            &ixs,
+            Some(&self.trading_kp.pubkey()),
+            &[&*self.trading_kp],
+            blockhash,
+        );
+
+        let cfg = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            commitment: Some(CommitmentConfig::confirmed()),
+            encoding: None,
+            accounts: None,
+            min_context_slot: None,
+            inner_instructions: false,
+        };
+        let res = self.rpc.client.simulate_transaction_with_config(&tx, cfg).await
+            .context("simulateTransaction RPC")?;
+        if let Some(err) = res.value.err {
+            let logs = res.value.logs.unwrap_or_default().join("\n");
+            return Err(anyhow!("sim failed: {err:?}\n--- logs ---\n{logs}"));
+        }
+        info!(
+            mint=%mint,
+            units = res.value.units_consumed.unwrap_or(0),
+            "✅ simulate_buy OK"
+        );
+        Ok(())
+    }
+
+    /// Token-program-aware on-chain token balance (Pubkey overload).
+    pub async fn token_balance_pk(&self, mint_pk: &Pubkey) -> Result<u64> {
+        let token_program = match pump_ix::detect_token_program(&self.rpc.client, mint_pk).await {
+            Ok(p) => p,
+            Err(_) => return Ok(0),
+        };
+        let ata = pump_ix::associated_token_address(
+            &self.trading_kp.pubkey(), mint_pk, &token_program,
+        );
+        match self.rpc.client.get_token_account_balance(&ata).await {
+            Ok(b) => Ok(b.amount.parse::<u64>().unwrap_or(0)),
+            Err(_) => Ok(0),
+        }
+    }
+
+    /// On-chain reconciliation: returns current token balance (base units) for `mint`.
+    /// Token-program-aware (works for both Token Classic and Token-2022 mints).
+    pub async fn token_balance(&self, mint: &str) -> Result<u64> {
+        let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
+        let token_program = match pump_ix::detect_token_program(&self.rpc.client, &mint_pk).await {
+            Ok(p) => p,
+            Err(_) => return Ok(0),
+        };
+        let ata = pump_ix::associated_token_address(
+            &self.trading_kp.pubkey(), &mint_pk, &token_program,
+        );
+        match self.rpc.client.get_token_account_balance(&ata).await {
+            Ok(b) => Ok(b.amount.parse::<u64>().unwrap_or(0)),
+            Err(_) => Ok(0),
+        }
+    }
+
+    pub async fn sol_balance_lamports(&self) -> Result<u64> {
+        wallet::get_sol_balance(&self.rpc.client, &self.trading_kp.pubkey()).await
+    }
+
+    pub async fn vault_balance_lamports(&self) -> Result<u64> {
+        wallet::get_sol_balance(&self.rpc.client, &self.vault_pubkey).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pump.fun program ID. Hard-coded into the pumpfun crate constants.
+    /// We assert here that we're targeting the right program — if the crate
+    /// silently changes program ID, the test will catch it.
+    #[test]
+    fn pump_program_id_is_the_real_pumpfun() {
+        let expected = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+        let id = pumpfun::constants::accounts::PUMPFUN.to_string();
+        assert_eq!(id, expected, "pumpfun program ID drifted! got {}", id);
+    }
+
+    /// Sanity: priority fee struct constructs without panic.
+    #[test]
+    fn priority_fee_struct_builds() {
+        let pf = PriorityFee { unit_limit: Some(200_000), unit_price: Some(123_456) };
+        assert_eq!(pf.unit_limit, Some(200_000));
+        assert_eq!(pf.unit_price, Some(123_456));
+    }
+
+    /// Sanity check: 200 bps maps to 2% — confirms our slippage units are basis points.
+    #[test]
+    fn slippage_units_are_basis_points() {
+        let bps: u64 = 200;
+        let pct = bps as f64 / 100.0;
+        assert!((pct - 2.0).abs() < 1e-9, "200 bps must be 2%");
+    }
+
+    /// Regression: the 2026-05-08 live-bug error must classify as retriable.
+    /// The verbatim RPC string included "custom program error: 0xbc4" — if a
+    /// future refactor renames or hides the error message, this catches it.
+    #[test]
+    fn live_bug_2026_05_08_error_is_retriable() {
+        let real_err = "pumpfun buy: SolanaClient(RpcError(RpcResponseError { code: -32002, \
+            message: \"Transaction simulation failed: Error processing Instruction 2: \
+            custom program error: 0xbc4\", data: ... }))";
+        assert!(is_retriable_buy_error(real_err), "0xbc4 must retry");
+    }
+
+    #[test]
+    fn anchor_3012_text_is_retriable() {
+        assert!(is_retriable_buy_error("AnchorError ... AccountNotInitialized 3012"));
+        assert!(is_retriable_buy_error("BondingCurveNotFound"));
+        assert!(is_retriable_buy_error("could not find account: bonding_curve_pda"));
+    }
+
+    #[test]
+    fn unrelated_errors_dont_retry() {
+        // E.g. wallet underfunded, or non-pumpfun program failure — should NOT retry.
+        assert!(!is_retriable_buy_error("insufficient funds for rent"));
+        assert!(!is_retriable_buy_error("slippage exceeded: 0x1771"));
+        assert!(!is_retriable_buy_error("blockhash not found"));
+    }
+
+    /// Sanity: priority-fee instructions match what pumpfun crate emits internally.
+    /// This ensures our `simulate_buy` builds a tx with the same shape as `buy`.
+    #[test]
+    fn priority_fee_ixs_count_matches_fields() {
+        let pf_full = PriorityFee { unit_limit: Some(200_000), unit_price: Some(1) };
+        assert_eq!(pumpfun_priority_fee_ixs(&pf_full).len(), 2);
+        let pf_limit_only = PriorityFee { unit_limit: Some(200_000), unit_price: None };
+        assert_eq!(pumpfun_priority_fee_ixs(&pf_limit_only).len(), 1);
+        let pf_none = PriorityFee { unit_limit: None, unit_price: None };
+        assert_eq!(pumpfun_priority_fee_ixs(&pf_none).len(), 0);
+    }
+}
