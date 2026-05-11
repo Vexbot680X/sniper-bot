@@ -604,6 +604,35 @@ async fn handle_new_token(
 
     let symbol = if tok.symbol.is_empty() { tok.name.clone() } else { tok.symbol.clone() };
 
+    // 🛡️ Phase 3 Feature.4: resolve authoritative dev/creator pubkey for this
+    // position. Live mode fetches the bonding-curve `creator` field on-chain
+    // (one RPC call — only fires for tokens that pass all earlier filters).
+    // Falls back to PumpPortal's `traderPublicKey` on RPC failure so we never
+    // refuse a trade because of a transient RPC hiccup. Paper mode uses the
+    // trader pubkey directly. Persisted on the Position so Feature.5's
+    // rug-watcher knows which wallet to monitor for THIS position.
+    let resolved_dev_pubkey: Option<String> = if let Some(ex) = executor {
+        match ex.fetch_bonding_curve_creator(&tok.mint).await {
+            Ok(pk) => {
+                let s = pk.to_string();
+                let from_trader = tok.trader.as_deref();
+                if from_trader.map(|t| t != s).unwrap_or(false) {
+                    info!(
+                        mint=%tok.mint, on_chain_creator=%s, ws_trader=?from_trader,
+                        "ℹ️ on-chain creator differs from WS traderPublicKey — using on-chain"
+                    );
+                }
+                Some(s)
+            }
+            Err(e) => {
+                warn!(mint=%tok.mint, error=?e, "fetch_bonding_curve_creator failed; falling back to traderPublicKey");
+                tok.trader.clone()
+            }
+        }
+    } else {
+        tok.trader.clone()
+    };
+
     let pos = match executor {
         // LIVE path
         Some(ex) => {
@@ -638,6 +667,7 @@ async fn handle_new_token(
                 cfg.trading.position_size_sol,
                 sol_usd,
                 cfg.trading.max_hold_seconds,
+                resolved_dev_pubkey.clone(),
             ).await;
             // Clear in-flight regardless of outcome
             {
@@ -681,6 +711,7 @@ async fn handle_new_token(
                 cfg.trading.stop_loss_pct,
                 size_usd,
                 cfg.trading.max_hold_seconds,
+                resolved_dev_pubkey.clone(),
             )
         }
     };

@@ -61,6 +61,16 @@ pub struct Position {
     pub take_profit_price: f64,
     pub stop_loss_price: f64,
     pub max_hold_until: DateTime<Utc>,
+    /// FEATURE (Phase 3.Feature.4): authoritative dev wallet pubkey for this
+    /// position's mint. In live mode, fetched at entry from the bonding-curve
+    /// account's on-chain `creator` field (offset 49, 32 bytes). Falls back to
+    /// PumpPortal's `traderPublicKey` when the RPC call fails. In paper mode
+    /// or pre-Feature.4 positions: typically None (legacy) or traderPublicKey.
+    ///
+    /// Persisted so Feature.5's WS rug-watcher knows whose sell tx to monitor
+    /// for THIS position, surviving restarts and bot reconnects.
+    #[serde(default)]
+    pub dev_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -236,6 +246,7 @@ mod tests {
             take_profit_price: 1.2,
             stop_loss_price: 0.9,
             max_hold_until: chrono::Utc::now() + chrono::Duration::seconds(60),
+            dev_pubkey: None,
         }
     }
 

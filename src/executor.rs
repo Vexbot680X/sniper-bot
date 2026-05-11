@@ -886,6 +886,41 @@ impl Executor {
         }
     }
 
+    /// FEATURE (Phase 3.Feature.4): fetch the authoritative dev/creator pubkey
+    /// for a pump.fun token from its on-chain bonding-curve account.
+    ///
+    /// Layout (per pump.fun's BondingCurve anchor account):
+    ///   8 disc + 8 v_tok + 8 v_sol + 8 r_tok + 8 r_sol + 8 t_supply +
+    ///   1 complete + 32 creator  =  81 bytes minimum
+    /// → creator field starts at byte offset 49, length 32.
+    ///
+    /// This is the authoritative source for the dev who deployed the token.
+    /// Differs from PumpPortal's `traderPublicKey` (initial buyer) in ~1% of
+    /// cases where the dev launched via a proxy/funded wallet. Used by
+    /// Feature.5 to wire the WS rug-watcher to the right wallet.
+    ///
+    /// Returns Err if:
+    ///   - bonding-curve account doesn't exist yet (first-buyer race window)
+    ///   - account data is unexpectedly short (corrupt or wrong account)
+    ///   - RPC call fails
+    /// Callers should treat any Err as "fall back to traderPublicKey or skip dev
+    /// tracking for this position" — don't abort the entry on this alone.
+    pub async fn fetch_bonding_curve_creator(&self, mint: &str) -> Result<Pubkey> {
+        let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
+        let bc_pda = pump_ix::bonding_curve_pda(&mint_pk);
+        let acct = self.rpc.client.get_account(&bc_pda).await
+            .map_err(|e| anyhow!("get_account(bc_pda) for {mint}: {e}"))?;
+        if acct.data.len() < 49 + 32 {
+            return Err(anyhow!(
+                "bonding-curve account for {mint} too small ({} bytes, need >= 81)",
+                acct.data.len()
+            ));
+        }
+        let creator_bytes: [u8; 32] = acct.data[49..49+32].try_into()
+            .map_err(|_| anyhow!("slice [49..81] -> [u8; 32] for {mint}"))?;
+        Ok(Pubkey::new_from_array(creator_bytes))
+    }
+
     pub async fn sol_balance_lamports(&self) -> Result<u64> {
         wallet::get_sol_balance(&self.rpc.client, &self.trading_kp.pubkey()).await
     }

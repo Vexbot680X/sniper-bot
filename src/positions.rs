@@ -25,6 +25,11 @@ pub fn evaluate_exit(pos: &Position, current_price: f64) -> ExitDecision {
 }
 
 /// PAPER-mode position open. Pure bookkeeping — no on-chain calls.
+///
+/// `dev_pubkey` is the authoritative dev/creator pubkey for the position's
+/// mint. In paper mode it's typically the PumpPortal `traderPublicKey`
+/// (initial buyer); None when that wasn't available. Persisted on the
+/// Position so Feature.5's rug-watcher can attach to it later.
 pub fn open_position_paper(
     state: &mut State,
     mint: String,
@@ -34,6 +39,7 @@ pub fn open_position_paper(
     sl_pct: f64,
     size_usd: f64,
     max_hold_seconds: u64,
+    dev_pubkey: Option<String>,
 ) -> Position {
     let tokens = size_usd / entry_price;
     let pos = Position {
@@ -47,6 +53,7 @@ pub fn open_position_paper(
         take_profit_price: entry_price * (1.0 + tp_pct / 100.0),
         stop_loss_price: entry_price * (1.0 - sl_pct / 100.0),
         max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
+        dev_pubkey,
     };
     state.bankroll_usd -= size_usd; // earmark
     state.open_positions.insert(mint, pos.clone());
@@ -63,6 +70,12 @@ pub fn open_position_paper(
 /// paper mode — so the +20% / -10% bands always reference the price the
 /// strategy decided to enter at, not the post-slippage fill.
 ///
+/// `dev_pubkey` is the authoritative dev/creator pubkey for this token,
+/// resolved by the caller (Feature.4 prefers the on-chain bonding-curve
+/// `creator` field; falls back to PumpPortal's `traderPublicKey` on RPC
+/// failure; None if neither is available). Persisted on the Position so
+/// Feature.5's rug-watcher can attach to it.
+///
 /// Caller is responsible for the in-flight gate (`state.live_in_flight`).
 pub async fn open_position_live(
     executor: &Executor,
@@ -75,6 +88,7 @@ pub async fn open_position_live(
     size_sol: f64,
     sol_usd: f64,
     max_hold_seconds: u64,
+    dev_pubkey: Option<String>,
 ) -> anyhow::Result<Position> {
     info!(%mint, %symbol, size_sol, "🚀 LIVE: submitting buy");
     let fill = executor.buy(&mint, size_sol).await?;
@@ -96,6 +110,7 @@ pub async fn open_position_live(
         take_profit_price: quoted_entry_price_usd * (1.0 + tp_pct / 100.0),
         stop_loss_price: quoted_entry_price_usd * (1.0 - sl_pct / 100.0),
         max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
+        dev_pubkey,
     };
 
     {
@@ -374,6 +389,7 @@ mod tests {
             take_profit_price: entry * (1.0 + tp / 100.0),
             stop_loss_price:  entry * (1.0 - sl / 100.0),
             max_hold_until: Utc::now() + chrono::Duration::seconds(hold_secs),
+            dev_pubkey: None,
         }
     }
 
@@ -405,7 +421,7 @@ mod tests {
     #[test]
     fn paper_open_decrements_bankroll_and_inserts() {
         let mut s = State::fresh(500.0);
-        let p = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300);
+        let p = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300, None);
         assert!((s.bankroll_usd - 482.0).abs() < 1e-9);
         assert_eq!(p.tokens_held, 18.0);
         assert!((p.take_profit_price - 1.20).abs() < 1e-9);
@@ -419,7 +435,7 @@ mod tests {
         // Exit value = 18 * 1.20 = 21.60. PnL = 3.60. Skim 50% = 1.80.
         let db = crate::storage::Db::open(":memory:").unwrap();
         let mut s = State::fresh(500.0);
-        let _ = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300);
+        let _ = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300, None);
         // After open: bankroll = 482
         let cr = close_position_paper(&mut s, &db, "MINT", 1.20, "take_profit", 50.0).unwrap();
         // bankroll back: 482 + 21.60 = 503.60, then -1.80 skim = 501.80
@@ -433,7 +449,7 @@ mod tests {
     fn paper_close_no_skim_on_loss() {
         let db = crate::storage::Db::open(":memory:").unwrap();
         let mut s = State::fresh(500.0);
-        let _ = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300);
+        let _ = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300, None);
         let cr = close_position_paper(&mut s, &db, "MINT", 0.90, "stop_loss", 50.0).unwrap();
         // PnL = 18 * 0.9 - 18 = -1.8. No skim on loss.
         assert!((cr.skimmed_usd).abs() < 1e-9);
