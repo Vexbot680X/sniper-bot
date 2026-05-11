@@ -165,6 +165,20 @@ pub struct Trading {
     /// other holders' activity, reducing our per-tranche concentration. Default 500.
     #[serde(default = "default_scale_out_delay_ms")]
     pub scale_out_delay_ms: u64,
+
+    /// FEATURE (Phase 3.Feature.3): pre-buy dev vetting.
+    /// Every NewToken event is recorded against its dev pubkey. At entry time:
+    ///   - If dev is on `dev_blacklist`, refuse immediately.
+    ///   - If dev has launched > `dev_vetting_max_launches_24h` tokens in the
+    ///     last 24h, refuse (overwhelmingly likely serial rugger).
+    /// Default ON. Cheapest filter we can run; one indexed-table query.
+    #[serde(default = "default_dev_vetting_required")]
+    pub dev_vetting_required: bool,
+
+    /// Max number of distinct mints a dev pubkey can have launched in the last
+    /// 24h before we refuse their next one. Default 3.
+    #[serde(default = "default_dev_vetting_max_launches")]
+    pub dev_vetting_max_launches_24h: u32,
 }
 
 fn default_slippage_bps() -> u16 { 200 }
@@ -178,6 +192,8 @@ fn default_pre_buy_fee_bps() -> u16 { 100 }
 fn default_scale_out_enabled() -> bool { true }
 fn default_scale_out_tranches() -> u8 { 3 }
 fn default_scale_out_delay_ms() -> u64 { 500 }
+fn default_dev_vetting_required() -> bool { true }
+fn default_dev_vetting_max_launches() -> u32 { 3 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scanner {

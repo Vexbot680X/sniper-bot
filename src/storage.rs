@@ -116,6 +116,27 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_live_attempts_attempted_at ON live_attempts(attempted_at);
             CREATE INDEX IF NOT EXISTS idx_live_attempts_outcome ON live_attempts(outcome);
             CREATE INDEX IF NOT EXISTS idx_live_attempts_mint ON live_attempts(mint);
+
+            -- FEATURE (Phase 3.Feature.3): serial-rugger detector backing store.
+            -- Append-only log of every (dev_pubkey, mint) launch observation we see.
+            -- Populated for every NewToken event (whether we trade or not) so the
+            -- 24h rolling count is accurate even on tokens we filter out.
+            CREATE TABLE IF NOT EXISTS dev_deployments (
+                dev_pubkey TEXT NOT NULL,
+                mint       TEXT NOT NULL,
+                seen_at    TEXT NOT NULL,
+                UNIQUE(dev_pubkey, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dev_deployments_dev_seen ON dev_deployments(dev_pubkey, seen_at);
+
+            -- FEATURE (Phase 3.Feature.3): manual blacklist of known scammer wallets.
+            -- Currently appended only by the operator (no auto-blacklist code yet).
+            -- Future: auto-add wallets that produce N consecutive rugs against us.
+            CREATE TABLE IF NOT EXISTS dev_blacklist (
+                dev_pubkey TEXT PRIMARY KEY,
+                added_at   TEXT NOT NULL,
+                reason     TEXT
+            );
             "#,
         )?;
 
@@ -126,6 +147,11 @@ impl Db {
             "ALTER TABLE trades ADD COLUMN entry_sig TEXT",
             "ALTER TABLE trades ADD COLUMN exit_sig TEXT",
             "ALTER TABLE trades ADD COLUMN fees_lamports INTEGER NOT NULL DEFAULT 0",
+            // Phase 3.Feature.3: dev_deployments table (added in CREATE block above
+            // for fresh installs; this migration creates it on pre-existing DBs).
+            "CREATE TABLE IF NOT EXISTS dev_deployments (dev_pubkey TEXT NOT NULL, mint TEXT NOT NULL, seen_at TEXT NOT NULL, UNIQUE(dev_pubkey, mint))",
+            "CREATE INDEX IF NOT EXISTS idx_dev_deployments_dev_seen ON dev_deployments(dev_pubkey, seen_at)",
+            "CREATE TABLE IF NOT EXISTS dev_blacklist (dev_pubkey TEXT PRIMARY KEY, added_at TEXT NOT NULL, reason TEXT)",
         ];
         for m in &migrations {
             let _ = conn_inner.execute(m, []);  // ignore "duplicate column" errors
@@ -193,5 +219,146 @@ impl Db {
             params![Utc::now().to_rfc3339(), bankroll, open as i64, trades as i64],
         )?;
         Ok(())
+    }
+
+    /// FEATURE (Phase 3.Feature.3): record that we observed `dev_pubkey`
+    /// deploy `mint`. Append-only — the UNIQUE(dev,mint) constraint silently
+    /// deduplicates re-observations of the same launch. Safe to call on every
+    /// NewToken event regardless of whether we then trade the token.
+    pub fn record_dev_deployment(&self, dev_pubkey: &str, mint: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // INSERT OR IGNORE on the UNIQUE constraint; cheap and idempotent.
+        conn.execute(
+            "INSERT OR IGNORE INTO dev_deployments (dev_pubkey, mint, seen_at) VALUES (?1, ?2, ?3)",
+            params![dev_pubkey, mint, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// FEATURE (Phase 3.Feature.3): count of distinct mints `dev_pubkey` has
+    /// been observed deploying since `since` (UTC). Used by the serial-rugger
+    /// filter: a dev who launches >3 tokens in 24h is overwhelmingly likely
+    /// to be a serial rugger and we refuse their next launch.
+    pub fn count_dev_deployments_since(
+        &self,
+        dev_pubkey: &str,
+        since: chrono::DateTime<Utc>,
+    ) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM dev_deployments WHERE dev_pubkey = ?1 AND seen_at >= ?2",
+        )?;
+        let n: i64 = stmt.query_row(
+            params![dev_pubkey, since.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// FEATURE (Phase 3.Feature.3): True if dev_pubkey is on the manual
+    /// blacklist. Used by the entry filter to immediately reject any token
+    /// the operator has flagged.
+    pub fn is_dev_blacklisted(&self, dev_pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dev_blacklist WHERE dev_pubkey = ?1",
+            params![dev_pubkey],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+}
+
+#[cfg(test)]
+mod dev_vetting_tests {
+    use super::*;
+
+    fn db() -> Db {
+        // In-memory SQLite — fast, isolated per test.
+        Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn record_dev_deployment_then_count() {
+        let db = db();
+        let dev = "DEV1";
+        // Three distinct mints from same dev
+        db.record_dev_deployment(dev, "M1").unwrap();
+        db.record_dev_deployment(dev, "M2").unwrap();
+        db.record_dev_deployment(dev, "M3").unwrap();
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let n = db.count_dev_deployments_since(dev, since).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn duplicate_dev_mint_pairs_are_deduplicated() {
+        let db = db();
+        let dev = "DEV1";
+        db.record_dev_deployment(dev, "SAMEMINT").unwrap();
+        db.record_dev_deployment(dev, "SAMEMINT").unwrap();
+        db.record_dev_deployment(dev, "SAMEMINT").unwrap();
+        let since = Utc::now() - chrono::Duration::hours(1);
+        // UNIQUE(dev, mint) → only the first insert counts
+        assert_eq!(db.count_dev_deployments_since(dev, since).unwrap(), 1);
+    }
+
+    #[test]
+    fn different_devs_are_independent() {
+        let db = db();
+        db.record_dev_deployment("DEV_A", "M1").unwrap();
+        db.record_dev_deployment("DEV_A", "M2").unwrap();
+        db.record_dev_deployment("DEV_B", "M3").unwrap();
+        let since = Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(db.count_dev_deployments_since("DEV_A", since).unwrap(), 2);
+        assert_eq!(db.count_dev_deployments_since("DEV_B", since).unwrap(), 1);
+        assert_eq!(db.count_dev_deployments_since("DEV_NEW", since).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_respects_time_window() {
+        let db = db();
+        // Manual insert with a past timestamp so we can verify time filtering.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO dev_deployments (dev_pubkey, mint, seen_at) VALUES (?1, ?2, ?3)",
+                params![
+                    "DEV_OLD", "OLDMINT",
+                    (Utc::now() - chrono::Duration::hours(48)).to_rfc3339()
+                ],
+            ).unwrap();
+        }
+        // Today's launch counts
+        db.record_dev_deployment("DEV_OLD", "NEWMINT").unwrap();
+        // Last 24h → only the new one
+        let last_24h = Utc::now() - chrono::Duration::hours(24);
+        assert_eq!(db.count_dev_deployments_since("DEV_OLD", last_24h).unwrap(), 1);
+        // Last 72h → both
+        let last_72h = Utc::now() - chrono::Duration::hours(72);
+        assert_eq!(db.count_dev_deployments_since("DEV_OLD", last_72h).unwrap(), 2);
+    }
+
+    #[test]
+    fn blacklist_lookup_works() {
+        let db = db();
+        assert!(!db.is_dev_blacklisted("FRESH_DEV").unwrap());
+        // Manual insert; future API will expose add_to_blacklist().
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO dev_blacklist (dev_pubkey, added_at, reason) VALUES (?1, ?2, ?3)",
+                params!["KNOWN_SCAMMER", Utc::now().to_rfc3339(), "manual_op_flag"],
+            ).unwrap();
+        }
+        assert!(db.is_dev_blacklisted("KNOWN_SCAMMER").unwrap());
+        assert!(!db.is_dev_blacklisted("FRESH_DEV").unwrap());
+    }
+
+    #[test]
+    fn empty_dev_db_returns_zero_not_error() {
+        let db = db();
+        let since = Utc::now() - chrono::Duration::hours(24);
+        assert_eq!(db.count_dev_deployments_since("UNKNOWN", since).unwrap(), 0);
     }
 }

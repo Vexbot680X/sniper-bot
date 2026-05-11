@@ -441,6 +441,58 @@ async fn handle_new_token(
     executor: Option<&Arc<Executor>>,
     tok: pumpportal::NewToken,
 ) -> Result<()> {
+    // 🛡️ Phase 3 Feature.3: record EVERY observed launch against its dev
+    // pubkey, before any filter runs, so the 24h rolling count stays accurate
+    // even on tokens we never consider trading. PumpPortal's `traderPublicKey`
+    // is the initial-buy signer on launch — which is the dev (or their funded
+    // wallet) in ~99% of cases.
+    if let Some(dev) = tok.trader.as_deref() {
+        if !dev.is_empty() {
+            if let Err(e) = db.record_dev_deployment(dev, &tok.mint) {
+                warn!(error=?e, dev=%dev, mint=%tok.mint, "failed to record dev deployment");
+            }
+        }
+    }
+
+    // 🛡️ Phase 3 Feature.3: pre-buy dev vetting.
+    // Cheapest entry filter: one indexed-table query each, run before any
+    // mcap/age math. Blacklist hits are an immediate refuse; serial-rugger
+    // detection looks at how many distinct mints this dev has launched in
+    // the last 24h. Threshold is configurable (default 3).
+    if cfg.trading.dev_vetting_required {
+        if let Some(dev) = tok.trader.as_deref() {
+            if !dev.is_empty() {
+                // Manual blacklist check
+                match db.is_dev_blacklisted(dev) {
+                    Ok(true) => {
+                        let reason = "dev_blacklisted";
+                        info!(mint=%tok.mint, dev=%dev, "❌ dev blacklisted — entry refused");
+                        let _ = db.record_rejection(&tok.mint, reason);
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(e) => warn!(error=?e, dev=%dev, "blacklist lookup failed; continuing"),
+                }
+                // Serial-rugger detection: count launches in last 24h
+                let since = chrono::Utc::now() - chrono::Duration::hours(24);
+                match db.count_dev_deployments_since(dev, since) {
+                    Ok(n) if n > cfg.trading.dev_vetting_max_launches_24h => {
+                        let reason = format!("serial_rugger_{}_launches_24h", n);
+                        info!(
+                            mint=%tok.mint, dev=%dev, launches_24h=n,
+                            max_allowed=cfg.trading.dev_vetting_max_launches_24h,
+                            "❌ serial-rugger pattern — entry refused"
+                        );
+                        let _ = db.record_rejection(&tok.mint, &reason);
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error=?e, dev=%dev, "dev deployment count lookup failed; continuing"),
+                }
+            }
+        }
+    }
+
     {
         let s = state.lock().await;
         if s.open_positions.len() >= cfg.trading.max_concurrent_positions { return Ok(()); }
