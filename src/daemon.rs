@@ -702,9 +702,14 @@ async fn force_exit_all(
             }
             s.live_selling.insert(mint.clone());
         }
+        let scale_out = positions::ScaleOutOpts {
+            enabled: cfg.trading.scale_out_enabled,
+            tranches: cfg.trading.scale_out_tranches,
+            delay_ms: cfg.trading.scale_out_delay_ms,
+        };
         let result = positions::close_position_live(
             executor.as_ref(), state, db, &mint, quoted_exit, "forced_exit_all",
-            cfg.skim.skim_pct, sol_usd,
+            cfg.skim.skim_pct, sol_usd, scale_out,
         ).await;
         {
             let mut s = state.lock().await;
@@ -814,9 +819,14 @@ async fn check_positions(
                     }
                     s.live_selling.insert(mint.clone());
                 }
+                let scale_out = positions::ScaleOutOpts {
+                    enabled: cfg.trading.scale_out_enabled,
+                    tranches: cfg.trading.scale_out_tranches,
+                    delay_ms: cfg.trading.scale_out_delay_ms,
+                };
                 let close_result = positions::close_position_live(
                     ex.as_ref(), state, db, &mint, current, &dec.reason,
-                    cfg.skim.skim_pct, sol_usd,
+                    cfg.skim.skim_pct, sol_usd, scale_out,
                 ).await;
                 {
                     let mut s = state.lock().await;

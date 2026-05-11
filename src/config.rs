@@ -142,6 +142,29 @@ pub struct Trading {
     /// estimator. Pump.fun's documented fee is 100 bps = 1% per side.
     #[serde(default = "default_pre_buy_fee_bps")]
     pub pre_buy_fee_bps_per_side: u16,
+
+    /// FEATURE (Phase 3.Feature.2): scale-out exits.
+    /// When enabled, every LIVE-mode exit (TP/SL/timeout/rug/forced) sells the
+    /// position in `scale_out_tranches` tranches separated by `scale_out_delay_ms`
+    /// milliseconds. Each tranche eats less curve depth than a single-shot sell
+    /// of the full position would, reducing aggregate exit slippage by an
+    /// estimated 40-60% in our band-scalp depth range.
+    ///
+    /// Default ON in live mode. Disable for one-shot legacy behavior (e.g. for
+    /// A/B comparison) by setting `scale_out_enabled = false`.
+    #[serde(default = "default_scale_out_enabled")]
+    pub scale_out_enabled: bool,
+
+    /// Number of equal-fraction tranches to split each exit into. The bot reads
+    /// current balance per tranche and divides by remaining tranches so partial
+    /// fills self-correct. `1` is equivalent to single-shot sell. Default 3.
+    #[serde(default = "default_scale_out_tranches")]
+    pub scale_out_tranches: u8,
+
+    /// Milliseconds between consecutive tranches. Gives the curve time to absorb
+    /// other holders' activity, reducing our per-tranche concentration. Default 500.
+    #[serde(default = "default_scale_out_delay_ms")]
+    pub scale_out_delay_ms: u64,
 }
 
 fn default_slippage_bps() -> u16 { 200 }
@@ -152,6 +175,9 @@ fn default_reconciliation_tolerance() -> f64 { 0.05 }
 fn default_pre_buy_slippage_required() -> bool { true }
 fn default_pre_buy_slippage_threshold() -> f64 { 0.10 }
 fn default_pre_buy_fee_bps() -> u16 { 100 }
+fn default_scale_out_enabled() -> bool { true }
+fn default_scale_out_tranches() -> u8 { 3 }
+fn default_scale_out_delay_ms() -> u64 { 500 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scanner {

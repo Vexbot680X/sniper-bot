@@ -512,6 +512,147 @@ impl Executor {
         Ok(fill)
     }
 
+    /// FEATURE (Phase 3.Feature.2): scale-out sell.
+    /// Sells the full holdings of `mint` in N tranches, with `delay_ms` between
+    /// each tranche. Each tranche reads the CURRENT on-chain balance and sells
+    /// `remaining_balance / remaining_tranches` — this self-corrects for partial
+    /// fills, dust, and rounding without any extra state.
+    ///
+    /// Returns an aggregated SellFill summing every successful tranche. The
+    /// `signature` field carries the FINAL successful tranche's signature.
+    ///
+    /// If a tranche fails mid-way, the scale-out aborts and returns what we got
+    /// so far — a partial exit always beats a stuck position. If the very first
+    /// tranche fails, the error propagates.
+    ///
+    /// `n_tranches == 0 || n_tranches == 1` is equivalent to a single-shot sell.
+    pub async fn sell_scale_out(
+        &self,
+        mint: &str,
+        n_tranches: u8,
+        delay_ms: u64,
+    ) -> Result<SellFill> {
+        if n_tranches <= 1 {
+            return self.sell_all(mint).await;
+        }
+        let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
+
+        // Aggregate across tranches
+        let mut total_tokens_sold: u64 = 0;
+        let mut total_sol_received: u64 = 0;
+        let mut last_sig: Option<Signature> = None;
+        let mut tranches_completed: u8 = 0;
+
+        for i in 0..n_tranches {
+            let remaining_tranches = n_tranches - i;
+
+            // Read CURRENT balance (post-prior-tranches)
+            let pre_tokens = self.token_balance_pk(&mint_pk).await.unwrap_or(0);
+            if pre_tokens == 0 {
+                info!(mint=%mint, tranche=i+1, of=n_tranches, "scale-out: zero balance, exit early");
+                break;
+            }
+            // For all but the last tranche: take 1/remaining_tranches of current balance.
+            // For the last tranche: take everything remaining (avoids dust leftover).
+            let tokens_to_sell_base: u64 = if remaining_tranches == 1 {
+                pre_tokens
+            } else {
+                pre_tokens / remaining_tranches as u64
+            };
+            if tokens_to_sell_base == 0 {
+                info!(mint=%mint, tranche=i+1, of=n_tranches, pre_tokens, "scale-out: per-tranche amount rounded to zero, skipping");
+                continue;
+            }
+
+            match self.sell_partial(&mint_pk, tokens_to_sell_base).await {
+                Ok(fill) => {
+                    total_tokens_sold = total_tokens_sold.saturating_add(fill.tokens_sold_base);
+                    total_sol_received = total_sol_received.saturating_add(fill.sol_received_lamports);
+                    last_sig = Some(fill.signature);
+                    tranches_completed += 1;
+                    info!(
+                        mint=%mint, tranche=i+1, of=n_tranches,
+                        sig=%fill.signature, tokens=fill.tokens_sold_base,
+                        sol_lamports=fill.sol_received_lamports,
+                        "✅ scale-out tranche filled"
+                    );
+                }
+                Err(e) => {
+                    warn!(mint=%mint, tranche=i+1, of=n_tranches, error=?e,
+                          "⚠️ scale-out tranche FAILED; aborting scale-out, keeping any partial fills");
+                    if tranches_completed == 0 {
+                        return Err(e.context("scale-out first tranche failed"));
+                    }
+                    break;
+                }
+            }
+
+            // Inter-tranche delay (skip after the last one)
+            if i + 1 < n_tranches && delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        if tranches_completed == 0 {
+            return Err(anyhow!("scale-out: no tranches completed for {mint}"));
+        }
+
+        let final_sig = last_sig.ok_or_else(|| anyhow!("scale-out: completed tranches but no signature?"))?;
+        let effective_price_sol = if total_tokens_sold > 0 {
+            (total_sol_received as f64 / 1e9) / (total_tokens_sold as f64 / 1e6)
+        } else { 0.0 };
+        info!(
+            %mint, tranches_completed, of=n_tranches,
+            total_tokens=total_tokens_sold, total_sol_lamports=total_sol_received,
+            "🎯 scale-out aggregate"
+        );
+        Ok(SellFill {
+            signature: final_sig,
+            tokens_sold_base: total_tokens_sold,
+            sol_received_lamports: total_sol_received,
+            effective_price_sol,
+        })
+    }
+
+    /// Internal: sell a SPECIFIC `tokens_base` quantity (not "all") of `mint`.
+    /// Used by `sell_scale_out`. Same execution path as `sell_all` but with
+    /// explicit token quantity rather than wallet balance.
+    async fn sell_partial(&self, mint_pk: &Pubkey, tokens_base: u64) -> Result<SellFill> {
+        let slippage_pct = ((self.slippage_bps as f64 / 100.0).round() as u32).max(1);
+        let pre_sol = wallet::get_sol_balance(&self.rpc.client, &self.trading_kp.pubkey())
+            .await.unwrap_or(0);
+        // The pre_tokens_base for fill parsing is the ATA balance BEFORE this tranche,
+        // so parse_sell_fill's `sold = pre - post` works correctly per tranche.
+        let pre_tokens = self.token_balance_pk(mint_pk).await.unwrap_or(0);
+        if tokens_base == 0 || pre_tokens == 0 || tokens_base > pre_tokens {
+            return Err(anyhow!("sell_partial: invalid request tokens={} pre_balance={}", tokens_base, pre_tokens));
+        }
+        let tokens_human = tokens_base as f64 / 1e6;
+
+        let priority_fee_sol = match self.build_priority_fee().await {
+            Some(pf) => {
+                let unit_price = pf.unit_price.unwrap_or(0) as f64;
+                let unit_limit = pf.unit_limit.unwrap_or(200_000) as f64;
+                ((unit_price * unit_limit) / 1_000_000.0 / 1e9).max(0.0005).min(0.01)
+            }
+            None => 0.005,
+        };
+
+        let signed_tx = crate::pumpportal_trade::build_signed_trade_tx(
+            &self.trading_kp,
+            mint_pk,
+            crate::pumpportal_trade::TradeAction::Sell,
+            tokens_human,
+            false,
+            slippage_pct,
+            priority_fee_sol,
+            "auto",
+        ).await.context("pumpportal build sell_partial tx")?;
+        let sig = self.send_versioned_tx(&signed_tx).await
+            .map_err(|e| anyhow!("pumpportal sell_partial: {e}"))?;
+        self.parse_sell_fill(&sig, mint_pk, pre_sol, pre_tokens).await
+    }
+
     /// Sell all tokens of `mint` held by the trading wallet. Returns the actual fill.
     pub async fn sell_all(&self, mint: &str) -> Result<SellFill> {
         let mint_pk = Pubkey::from_str(mint).context("parse mint")?;

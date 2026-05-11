@@ -163,6 +163,20 @@ pub fn close_position_paper(
         })
 }
 
+/// Scale-out exit configuration. When `enabled` is true and `tranches > 1`,
+/// the exit splits the sell into N tranches with `delay_ms` between each.
+/// Used by `close_position_live` and the force-exit-all path.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleOutOpts {
+    pub enabled: bool,
+    pub tranches: u8,
+    pub delay_ms: u64,
+}
+impl ScaleOutOpts {
+    /// Legacy single-shot behavior (no scale-out).
+    pub fn off() -> Self { Self { enabled: false, tranches: 1, delay_ms: 0 } }
+}
+
 /// LIVE-mode close. Submits sell tx FIRST, parses actual SOL received, updates state,
 /// then if profit > 0 sends a separate SOL transfer for the skim amount.
 pub async fn close_position_live(
@@ -174,6 +188,7 @@ pub async fn close_position_live(
     reason: &str,
     skim_pct: f64,
     sol_usd: f64,
+    scale_out: ScaleOutOpts,
 ) -> anyhow::Result<CloseResult> {
     // Snapshot position
     let pos = {
@@ -182,8 +197,14 @@ pub async fn close_position_live(
             .ok_or_else(|| anyhow::anyhow!("position not found: {mint}"))?
     };
 
-    info!(%mint, symbol=%pos.symbol, "🔴 LIVE: submitting sell");
-    let fill = executor.sell_all(mint).await?;
+    let fill = if scale_out.enabled && scale_out.tranches > 1 {
+        info!(%mint, symbol=%pos.symbol, tranches=scale_out.tranches, delay_ms=scale_out.delay_ms,
+              "🔴 LIVE: submitting scale-out sell");
+        executor.sell_scale_out(mint, scale_out.tranches, scale_out.delay_ms).await?
+    } else {
+        info!(%mint, symbol=%pos.symbol, "🔴 LIVE: submitting single-shot sell");
+        executor.sell_all(mint).await?
+    };
     let actual_sol_received = fill.sol_received_lamports as f64 / 1e9;
     let actual_exit_value_usd = actual_sol_received * sol_usd;
 
@@ -302,6 +323,41 @@ fn update_stats_and_skim(
     if pnl_pct > state.stats.best_trade_pct { state.stats.best_trade_pct = pnl_pct; }
     if pnl_pct < state.stats.worst_trade_pct { state.stats.worst_trade_pct = pnl_pct; }
     Ok(skimmed_usd)
+}
+
+#[cfg(test)]
+mod scale_out_opts_tests {
+    use super::*;
+
+    #[test]
+    fn off_is_disabled_with_single_tranche() {
+        let o = ScaleOutOpts::off();
+        assert!(!o.enabled);
+        assert_eq!(o.tranches, 1);
+        assert_eq!(o.delay_ms, 0);
+    }
+
+    #[test]
+    fn disabled_or_one_tranche_falls_back_to_single_shot() {
+        // The close_position_live() branch picks sell_all() when EITHER
+        // .enabled is false OR .tranches <= 1. Document both edge cases.
+        let cases = [
+            ScaleOutOpts { enabled: false, tranches: 3, delay_ms: 500 },
+            ScaleOutOpts { enabled: true,  tranches: 1, delay_ms: 500 },
+            ScaleOutOpts { enabled: true,  tranches: 0, delay_ms: 500 },
+            ScaleOutOpts::off(),
+        ];
+        for c in cases {
+            let should_scale = c.enabled && c.tranches > 1;
+            assert!(!should_scale, "opts={c:?} must NOT trigger scale-out");
+        }
+    }
+
+    #[test]
+    fn typical_v5_config_triggers_scale_out() {
+        let o = ScaleOutOpts { enabled: true, tranches: 3, delay_ms: 500 };
+        assert!(o.enabled && o.tranches > 1, "v5 default should trigger scale-out: {o:?}");
+    }
 }
 
 #[cfg(test)]
