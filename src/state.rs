@@ -111,6 +111,54 @@ impl State {
         );
     }
 
+    /// True when state looks fresh (never traded under any mode). Used to
+    /// auto-skip the reconciliation guard on first start so a freshly-init'd
+    /// `starting_bankroll_usd` of e.g. $500 doesn't trip the guard against a
+    /// chain balance of $0.
+    pub fn is_fresh(&self) -> bool {
+        self.mode.is_empty() && self.stats.trades_total == 0
+    }
+
+    /// Sum of book value tracked by this state:
+    ///   bankroll_usd + vault_usd + sum(open_positions.size_usd)
+    /// This is the value the bot "thinks" we have, in USD.
+    pub fn book_total_usd(&self) -> f64 {
+        let open_value: f64 = self.open_positions.values().map(|p| p.size_usd).sum();
+        self.bankroll_usd + self.vault_usd + open_value
+    }
+
+    /// SAFETY (Phase 3): reconciliation guard for live startup.
+    ///
+    /// Compares this state's book total to the supplied on-chain total.
+    /// Both numbers are in USD. Returns Ok if either:
+    ///   - relative divergence is within `tolerance_pct` of the larger side, OR
+    ///   - both sides are below $1 (dust-mode reconciliation noise).
+    ///
+    /// Returns Err with a clear message otherwise. The caller is responsible
+    /// for skipping the check when conditions warrant (paper mode, fresh state,
+    /// open positions, operator override).
+    ///
+    /// Tolerance is expressed as a fraction (0.05 = 5%).
+    pub fn check_reconciliation(
+        &self,
+        chain_total_usd: f64,
+        tolerance_pct: f64,
+    ) -> Result<f64> {
+        let book = self.book_total_usd();
+        let chain = chain_total_usd;
+        let larger = book.abs().max(chain.abs());
+        // Below $1 = dust-noise zone; allow.
+        if larger < 1.0 { return Ok(0.0); }
+        let divergence = (book - chain).abs() / larger;
+        if divergence <= tolerance_pct { return Ok(divergence); }
+        anyhow::bail!(
+            "state↔chain reconciliation FAILED: books=${:.2} chain=${:.2} divergence={:.1}% > tolerance {:.1}%. \
+             Either books drifted (rare; fix state.json) or funds moved externally without bot knowledge. \
+             Investigate before any live trade. To bypass once, run with --skip-reconcile.",
+            book, chain, divergence * 100.0, tolerance_pct * 100.0
+        )
+    }
+
     pub fn load_or_init<P: AsRef<Path>>(path: P, fresh_bankroll: f64) -> Result<Self> {
         if path.as_ref().exists() {
             let s = std::fs::read_to_string(&path)?;
@@ -174,5 +222,90 @@ mod tests {
         let mut s = State::fresh(500.0);
         s.mode = "live".to_string();
         assert!(s.check_mode_match("paper").is_err());
+    }
+
+    fn position(size_usd: f64) -> Position {
+        Position {
+            id: "t".into(),
+            mint: "M".into(),
+            symbol: "S".into(),
+            entry_price_usd: 1.0,
+            size_usd,
+            tokens_held: size_usd,
+            entered_at: chrono::Utc::now(),
+            take_profit_price: 1.2,
+            stop_loss_price: 0.9,
+            max_hold_until: chrono::Utc::now() + chrono::Duration::seconds(60),
+        }
+    }
+
+    #[test]
+    fn is_fresh_only_true_with_empty_mode_and_zero_trades() {
+        let s = State::fresh(500.0);
+        assert!(s.is_fresh(), "newly-init state should be fresh");
+        let mut s2 = State::fresh(500.0);
+        s2.mode = "live".to_string();
+        assert!(!s2.is_fresh(), "mode stamped → no longer fresh");
+        let mut s3 = State::fresh(500.0);
+        s3.stats.trades_total = 1;
+        assert!(!s3.is_fresh(), "any traded history → no longer fresh");
+    }
+
+    #[test]
+    fn book_total_sums_bankroll_vault_and_open_positions() {
+        let mut s = State::fresh(500.0); // bankroll=500
+        s.vault_usd = 50.0;
+        s.open_positions.insert("A".into(), position(30.0));
+        s.open_positions.insert("B".into(), position(20.0));
+        // 500 + 50 + 30 + 20
+        assert!((s.book_total_usd() - 600.0).abs() < 1e-9, "got {}", s.book_total_usd());
+    }
+
+    #[test]
+    fn reconciliation_passes_when_within_tolerance() {
+        let mut s = State::fresh(100.0);
+        s.mode = "live".to_string();
+        // chain = 102, books = 100 → 2% divergence < 5% tol → OK
+        assert!(s.check_reconciliation(102.0, 0.05).is_ok());
+        // chain = 98, books = 100 → 2% divergence < 5% tol → OK
+        assert!(s.check_reconciliation(98.0, 0.05).is_ok());
+        // chain = 100, books = 100 → 0% divergence → OK
+        let div = s.check_reconciliation(100.0, 0.05).unwrap();
+        assert!(div < 1e-9);
+    }
+
+    #[test]
+    fn reconciliation_fails_when_exceeds_tolerance() {
+        let mut s = State::fresh(212.0);
+        s.mode = "live".to_string();
+        // Real-world May 10 case: books said $212, chain had $3.
+        let err = s.check_reconciliation(3.0, 0.05).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("FAILED"), "err mentions FAILED: {msg}");
+        assert!(msg.contains("$212") || msg.contains("212.00"), "err mentions book: {msg}");
+        assert!(msg.contains("$3") || msg.contains("3.00"), "err mentions chain: {msg}");
+        assert!(msg.contains("divergence"), "err mentions divergence: {msg}");
+    }
+
+    #[test]
+    fn reconciliation_treats_sub_dollar_as_match() {
+        let mut s = State::fresh(0.40);
+        s.mode = "live".to_string();
+        // both sides under $1 → dust noise zone → pass
+        assert!(s.check_reconciliation(0.10, 0.05).is_ok());
+        assert!(s.check_reconciliation(0.0, 0.05).is_ok());
+    }
+
+    #[test]
+    fn reconciliation_includes_open_positions_in_book_total() {
+        // bankroll=50, vault=10, plus 1 open position size_usd=40 → book=100
+        let mut s = State::fresh(50.0);
+        s.mode = "live".to_string();
+        s.vault_usd = 10.0;
+        s.open_positions.insert("A".into(), position(40.0));
+        // chain reports $100 (matches) → OK
+        assert!(s.check_reconciliation(100.0, 0.05).is_ok());
+        // chain reports $50 (only bankroll+vault) → 50% divergence → FAIL
+        assert!(s.check_reconciliation(50.0, 0.05).is_err());
     }
 }

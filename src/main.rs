@@ -32,6 +32,14 @@ struct Cli {
     /// New entries are disabled for this run regardless of mode.
     #[arg(long)]
     force_exit_all: bool,
+
+    /// SAFETY: skip the live-mode reconciliation guard for this single run.
+    /// Default is enforced when `trading.reconciliation_required = true` in config.
+    /// Use only when you've intentionally moved funds outside the bot (e.g.
+    /// manual top-up or external withdrawal) and accept the books may drift.
+    /// A loud warning is logged. Has no effect in paper mode.
+    #[arg(long)]
+    skip_reconcile: bool,
 }
 
 #[tokio::main]
@@ -43,7 +51,10 @@ async fn main() -> Result<()> {
     let cfg = config::load(&cli.config)?;
     info!(?cfg.trading, "config loaded");
 
-    let opts = daemon::RunOpts { force_exit_all: cli.force_exit_all };
+    let opts = daemon::RunOpts {
+        force_exit_all: cli.force_exit_all,
+        skip_reconcile: cli.skip_reconcile,
+    };
     if let Err(e) = daemon::run_with_opts(cfg, opts).await {
         error!(error = ?e, "daemon exited with error");
         std::process::exit(1);

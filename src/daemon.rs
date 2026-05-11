@@ -40,6 +40,9 @@ pub struct RunOpts {
     /// market (ignoring TP/SL/timeout), then exit. Live-mode only — paper mode
     /// is treated as a no-op exit because there are no real funds to rescue.
     pub force_exit_all: bool,
+    /// SAFETY: if true, skip the live-mode reconciliation guard for this run.
+    /// Logged loudly. Use sparingly; the guard is here for a reason.
+    pub skip_reconcile: bool,
 }
 
 fn is_halted() -> bool { Path::new(HALT_FLAG).exists() }
@@ -109,6 +112,70 @@ pub async fn run_with_opts(cfg: Config, opts: RunOpts) -> Result<()> {
         let trading_pk = ex.trading_kp.pubkey();
         let trading_bal = ex.sol_balance_lamports().await.unwrap_or(0) as f64 / 1e9;
         let vault_bal = ex.vault_balance_lamports().await.unwrap_or(0) as f64 / 1e9;
+
+        // 🛡️ SAFETY (Phase 3.Safety.1): reconciliation guard — refuse to start if
+        // state.json's book total disagrees with on-chain reality by more than
+        // `cfg.trading.reconciliation_tolerance_pct`. Closes the May 8–10 footgun
+        // where bankroll books said $212 but the chain had $3, and the bot kept
+        // happily sizing trades against the wrong number.
+        {
+            let state_snapshot = state.lock().await.clone();
+            let skipped_reason = if !cfg.trading.reconciliation_required {
+                Some("config.trading.reconciliation_required = false".to_string())
+            } else if opts.skip_reconcile {
+                Some("--skip-reconcile CLI flag set".to_string())
+            } else if state_snapshot.is_fresh() {
+                Some("fresh state (no trades yet, mode unset)".to_string())
+            } else if !state_snapshot.open_positions.is_empty() {
+                Some(format!("{} open position(s) present; reconciliation requires pricing token holdings (skipped)", state_snapshot.open_positions.len()))
+            } else {
+                None
+            };
+
+            if let Some(reason) = skipped_reason {
+                warn!(reason=%reason, "⚠️ reconciliation guard SKIPPED");
+                tg.send(&format!("⚠️ *RECONCILIATION SKIPPED*\nReason: `{}`", reason)).await.ok();
+            } else {
+                let sol_usd = jup.sol_usd().await.unwrap_or(0.0);
+                if sol_usd <= 0.0 {
+                    error!("🔴 START REFUSED — reconciliation needs sol_usd but jupiter returned 0. Check jupiter_quote_url or use --skip-reconcile after manual review.");
+                    tg.send("🔴 *START REFUSED* — reconciliation: jupiter sol_usd unavailable. Re-run with `--skip-reconcile` after manual review if you really need to start now.").await.ok();
+                    anyhow::bail!("reconciliation: jupiter sol_usd returned 0");
+                }
+                let chain_total_usd = (trading_bal + vault_bal) * sol_usd;
+                let book_total_usd = state_snapshot.book_total_usd();
+                let tol = cfg.trading.reconciliation_tolerance_pct;
+                match state_snapshot.check_reconciliation(chain_total_usd, tol) {
+                    Ok(divergence) => {
+                        info!(
+                            chain_usd=%format!("{:.2}", chain_total_usd),
+                            book_usd=%format!("{:.2}", book_total_usd),
+                            divergence_pct=%format!("{:.2}", divergence*100.0),
+                            tolerance_pct=%format!("{:.2}", tol*100.0),
+                            "✅ reconciliation OK"
+                        );
+                        tg.send(&format!(
+                            "✅ *RECONCILIATION OK*\nChain: `${:.2}`  Books: `${:.2}`\nDivergence: `{:.2}%` (tol `{:.2}%`)",
+                            chain_total_usd, book_total_usd, divergence*100.0, tol*100.0
+                        )).await.ok();
+                    }
+                    Err(e) => {
+                        error!(
+                            chain_usd=%format!("{:.2}", chain_total_usd),
+                            book_usd=%format!("{:.2}", book_total_usd),
+                            error=%e,
+                            "🔴 START REFUSED — reconciliation mismatch"
+                        );
+                        tg.send(&format!(
+                            "🔴 *START REFUSED* — reconciliation mismatch\nChain: `${:.2}`  Books: `${:.2}`\n`{}`",
+                            chain_total_usd, book_total_usd, e
+                        )).await.ok();
+                        anyhow::bail!(e);
+                    }
+                }
+            }
+        }
+
         let banner = format!(
             "🔴 *LIVE MODE — REAL FUNDS*\nTrading: `{}`\nBalance: `{:.4} SOL`\nVault: `{}`\nVault balance: `{:.4} SOL`\nSlippage: `{}bps`  Priority fee pct: `{}`",
             trading_pk, trading_bal, ex.vault_pubkey, vault_bal,
