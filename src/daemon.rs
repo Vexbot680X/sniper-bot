@@ -12,12 +12,12 @@ use crate::storage::Db;
 use crate::telegram::Telegram;
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 
 /// Tracks recently-seen token symbols for copy-cat detection.
 type SymbolCache = Arc<Mutex<HashMap<String, i64>>>;
@@ -276,6 +276,77 @@ Wallet `{}`  cap `{} SOL`",
 
     let symbol_cache: SymbolCache = Arc::new(Mutex::new(HashMap::new()));
 
+    // Phase 3 Feature.5: shared set of mints that the rug-watcher has flagged
+    // for emergency exit. The position-checker drains this set every tick
+    // and fires close_position_live with reason="dev_dump_detected".
+    let pending_dev_dump_exits: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // 🛡️ Phase 3 Feature.5: dev wallet WS rug-watcher.
+    // Only spawn in live mode — paper positions have no on-chain reality.
+    // The watcher subscribes a Helius logsSubscribe stream per dev_pubkey and
+    // pushes DevDumpAlerts back when a dev signs any tx touching pump.fun.
+    // The alert-drain task below converts alerts into pending exit signals.
+    let dev_watcher: Option<crate::dev_watcher::DevWatcher> = if executor.is_some() && cfg.trading.rug_watcher_enabled {
+        let helius_key = std::env::var("HELIUS_API_KEY").unwrap_or_default();
+        if helius_key.is_empty() {
+            warn!("⚠️ rug_watcher_enabled but HELIUS_API_KEY not set — disabling rug watcher");
+            None
+        } else {
+            let ws_url = format!("wss://mainnet.helius-rpc.com/?api-key={}", helius_key);
+            let (w, mut alert_rx) = crate::dev_watcher::DevWatcher::spawn(ws_url, 64);
+
+            // Re-subscribe any positions already open at startup (post-restart).
+            // We must do this BEFORE spawning the alert-drain task in case the
+            // first alert lands immediately.
+            {
+                let s = state.lock().await;
+                for (mint, pos) in &s.open_positions {
+                    w.add(mint, pos.dev_pubkey.as_deref()).await;
+                }
+            }
+
+            // Alert-drain task: converts DevDumpAlerts into either telegram-only
+            // notifications (alert_only=true) or pending exit signals + telegram
+            // (alert_only=false).
+            {
+                let cfg = cfg.clone();
+                let state = state.clone();
+                let tg = tg.clone();
+                let pending_exits = pending_dev_dump_exits.clone();
+                tokio::spawn(async move {
+                    while let Some(alert) = alert_rx.recv().await {
+                        // Confirm the position still exists. If we already exited
+                        // (e.g. timeout fired first), the alert is stale.
+                        let still_open = state.lock().await.open_positions.contains_key(&alert.mint);
+                        if !still_open {
+                            debug!(mint=%alert.mint, sig=%alert.dev_signature, "dev_dump alert for already-closed position — ignored");
+                            continue;
+                        }
+                        warn!(
+                            mint=%alert.mint, dev=%alert.dev_pubkey, sig=%alert.dev_signature,
+                            alert_only=cfg.trading.rug_watcher_alert_only,
+                            "🚨 DEV DUMP DETECTED"
+                        );
+                        let mode_label = if cfg.trading.rug_watcher_alert_only { "ALERT-ONLY" } else { "AUTO-EXIT" };
+                        let _ = tg.send(&format!(
+                            "🚨 *DEV DUMP DETECTED* ({})\nMint: `{}`\nDev: `{}`\n[dev tx](https://solscan.io/tx/{})",
+                            mode_label, alert.mint, alert.dev_pubkey, alert.dev_signature
+                        )).await;
+                        if !cfg.trading.rug_watcher_alert_only {
+                            let mut set = pending_exits.lock().await;
+                            set.insert(alert.mint.clone());
+                        }
+                    }
+                    warn!("dev_watcher alert receiver closed — rug-watcher inactive for remainder of session");
+                });
+            }
+
+            Some(w)
+        }
+    } else {
+        None
+    };
+
     tg.send(&format!(
         "⚡ *sniper-bot online*\nMode: `{}`\nBankroll: `${:.2}`\nTP/SL: `+{}% / -{}%`\nPosition: `{} SOL`\nPricing: bonding-curve (live)\nForce-exit-all: `{}`",
         cfg.trading.mode,
@@ -308,11 +379,16 @@ Wallet `{}`  cap `{} SOL`",
         let tg = tg.clone(); let jup = jup.clone(); let curves = curves.clone();
         let curve_sub = curve_sub.clone();
         let executor = executor.clone();
+        let pending_dev_dump_exits = pending_dev_dump_exits.clone();
+        let dev_watcher = dev_watcher.clone();
         tokio::spawn(async move {
             let interval = Duration::from_secs(cfg.scanner.position_check_interval_seconds);
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(e) = check_positions(&cfg, &db, &state, &tg, &jup, &curves, &curve_sub, executor.as_ref()).await {
+                if let Err(e) = check_positions(
+                    &cfg, &db, &state, &tg, &jup, &curves, &curve_sub, executor.as_ref(),
+                    &pending_dev_dump_exits, dev_watcher.as_ref(),
+                ).await {
                     error!(error=?e, "position check failed");
                 }
             }
@@ -325,6 +401,8 @@ Wallet `{}`  cap `{} SOL`",
         let cfg = cfg.clone(); let db = db.clone();
         let tg = tg.clone(); let jup = jup.clone(); let curve_sub = curve_sub.clone();
         let executor = executor.clone();
+        let pending_dev_dump_exits = pending_dev_dump_exits.clone();
+        let dev_watcher = dev_watcher.clone();
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -379,7 +457,10 @@ Wallet `{}`  cap `{} SOL`",
                     }
                 }
                 if updated_any {
-                    if let Err(e) = check_positions(&cfg, &db, &state, &tg, &jup, &curves, &curve_sub, executor.as_ref()).await {
+                    if let Err(e) = check_positions(
+                        &cfg, &db, &state, &tg, &jup, &curves, &curve_sub, executor.as_ref(),
+                        &pending_dev_dump_exits, dev_watcher.as_ref(),
+                    ).await {
                         warn!(error=?e, "post-poll position check failed");
                     }
                 }
@@ -420,8 +501,14 @@ Wallet `{}`  cap `{} SOL`",
         let curve_sub = curve_sub.clone();
         let symbol_cache = symbol_cache.clone();
         let executor = executor.clone();
+        let dev_watcher_clone = dev_watcher.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_new_token(&cfg, &db, &state, &tg, &jup, &curves, &curve_sub, &symbol_cache, executor.as_ref(), tok).await {
+            if let Err(e) = handle_new_token(
+                &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
+                &symbol_cache, executor.as_ref(),
+                dev_watcher_clone.as_ref(),
+                tok,
+            ).await {
                 warn!(error=?e, "handle_new_token failed");
             }
         });
@@ -439,6 +526,7 @@ async fn handle_new_token(
     curve_sub: &CurveSubscriber,
     symbol_cache: &SymbolCache,
     executor: Option<&Arc<Executor>>,
+    dev_watcher: Option<&crate::dev_watcher::DevWatcher>,
     tok: pumpportal::NewToken,
 ) -> Result<()> {
     // 🛡️ Phase 3 Feature.3: record EVERY observed launch against its dev
@@ -720,6 +808,13 @@ async fn handle_new_token(
         let _ = s.save(&cfg.storage.state_path);
     }
     info!(mint=%pos.mint, symbol=%pos.symbol, entry=pos.entry_price_usd, size=pos.size_usd, mode=%cfg.trading.mode, "🎯 entered position");
+
+    // Phase 3 Feature.5: wire this position into the rug-watcher.
+    // Only active in live mode (paper positions have no dev to watch).
+    if let Some(w) = dev_watcher {
+        w.add(&pos.mint, pos.dev_pubkey.as_deref()).await;
+    }
+
     let live_tail = if executor.is_some() { format!("\n_LIVE — real funds_") } else { String::new() };
     tg.send(&format!(
         "🎯 *ENTRY* `{}`\nSize: `${:.2}` @ `${:.10}`\nTP: `${:.10}` (+{}%)  SL: `${:.10}` (-{}%)\nMint: `{}`\n[pump.fun](https://pump.fun/{}){}",
@@ -840,6 +935,8 @@ async fn check_positions(
     curves: &CurveTracker,
     _curve_sub: &CurveSubscriber,
     executor: Option<&Arc<Executor>>,
+    pending_dev_dump_exits: &Mutex<HashSet<String>>,
+    dev_watcher: Option<&crate::dev_watcher::DevWatcher>,
 ) -> Result<()> {
     let mints: Vec<String> = {
         let s = state.lock().await;
@@ -865,6 +962,13 @@ async fn check_positions(
         let pnl_pct = (current / pos.entry_price_usd - 1.0) * 100.0;
         info!(mint=%mint, symbol=%pos.symbol, entry=pos.entry_price_usd, current=current, pnl_pct=pnl_pct, "📊 position check");
 
+        // Phase 3 Feature.5: dev_dump_detected has PRIORITY over all other
+        // exit reasons. If the rug-watcher flagged this mint, exit NOW.
+        let dev_dump = {
+            let mut set = pending_dev_dump_exits.lock().await;
+            set.remove(&mint) // consume the flag
+        };
+
         let mcap_sol = curve.price_in_sol() * TOTAL_SUPPLY;
         let mcap_usd = mcap_sol * sol_usd;
         let rug_triggered = if cfg.trading.rug_exit_mcap_usd > 0.0 {
@@ -875,7 +979,9 @@ async fn check_positions(
             false
         };
 
-        let dec = if rug_triggered {
+        let dec = if dev_dump {
+            positions::ExitDecision { should_exit: true, reason: "dev_dump_detected".into() }
+        } else if rug_triggered {
             positions::ExitDecision { should_exit: true, reason: "rug_collapse".into() }
         } else {
             positions::evaluate_exit(&pos, current)
@@ -948,6 +1054,10 @@ async fn check_positions(
         };
 
         curves.forget(&mint).await;
+        // Phase 3 Feature.5: stop watching the dev wallet for this mint.
+        if let Some(w) = dev_watcher {
+            w.remove(&mint).await;
+        }
         { let s = state.lock().await; let _ = s.save(&cfg.storage.state_path); }
 
         let (bankroll, vault) = { let s = state.lock().await; (s.bankroll_usd, s.vault_usd) };

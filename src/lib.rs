@@ -1,7 +1,9 @@
 //! Library surface for `sniper-bot`. Exposes only the modules the
 //! integration tests under `tests/` need to reach.
 
+pub mod bonding_curve;
 pub mod config;
+pub mod dev_watcher;
 pub mod executor;
 pub mod pump_ix;
 pub mod pumpportal_trade;

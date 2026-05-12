@@ -9,6 +9,7 @@ mod telegram;
 mod jupiter;
 mod pumpportal;
 mod bonding_curve;
+mod dev_watcher;
 mod scanner;
 mod positions;
 mod daemon;

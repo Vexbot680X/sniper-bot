@@ -179,6 +179,26 @@ pub struct Trading {
     /// 24h before we refuse their next one. Default 3.
     #[serde(default = "default_dev_vetting_max_launches")]
     pub dev_vetting_max_launches_24h: u32,
+
+    /// FEATURE (Phase 3.Feature.5): dev wallet WS rug-watcher.
+    /// When enabled, every open live position subscribes its dev_pubkey to a
+    /// Helius `logsSubscribe` stream. The instant the dev signs any tx that
+    /// touches the pump.fun program, we queue an emergency exit for the
+    /// position (bypassing TP/SL/timeout). Pure paper positions — those
+    /// without a dev_pubkey — are not watched.
+    ///
+    /// Default ON. Set false to disable rug-watcher entirely (back to
+    /// pre-Feature.5 behavior: TP/SL/timeout only).
+    #[serde(default = "default_rug_watcher_enabled")]
+    pub rug_watcher_enabled: bool,
+
+    /// SAFETY (Phase 3.Feature.5): alert-only mode for the rug-watcher.
+    /// When TRUE, the watcher logs + telegrams alerts but does NOT auto-exit
+    /// positions. Use during initial validation to measure false-positive
+    /// rate on real data before letting the watcher act autonomously.
+    /// Default TRUE — must be explicitly disabled to enable auto-exit.
+    #[serde(default = "default_rug_watcher_alert_only")]
+    pub rug_watcher_alert_only: bool,
 }
 
 fn default_slippage_bps() -> u16 { 200 }
@@ -194,6 +214,8 @@ fn default_scale_out_tranches() -> u8 { 3 }
 fn default_scale_out_delay_ms() -> u64 { 500 }
 fn default_dev_vetting_required() -> bool { true }
 fn default_dev_vetting_max_launches() -> u32 { 3 }
+fn default_rug_watcher_enabled() -> bool { true }
+fn default_rug_watcher_alert_only() -> bool { true }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scanner {

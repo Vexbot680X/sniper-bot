@@ -63,6 +63,18 @@ scale_out_delay_ms = 500
 dev_vetting_required = true
 dev_vetting_max_launches_24h = 3
 
+# 🛡️ FEATURE (Phase 3.Feature.5): dev wallet WS rug-watcher.
+# Every open live position subscribes its dev_pubkey to a Helius logsSubscribe
+# stream. Any tx the dev signs that touches the pump.fun program triggers a
+# DevDumpAlert. With alert_only=true, alerts are telegrammed but no auto-exit.
+# With alert_only=false, alerts queue the position for emergency exit
+# (bypassing TP/SL/timeout) with exit_reason="dev_dump_detected".
+#
+# rug_watcher_alert_only = true (DEFAULT for Phase B initial validation)
+# Flip to false only after measuring false-positive rate on real data.
+rug_watcher_enabled = true
+rug_watcher_alert_only = true
+
 [skim]
 # Continuous profit skim: on every winning close, move skim_pct of the realized
 # gain to a sidelined `vault_usd` balance. Vault is one-way — never withdrawn back
