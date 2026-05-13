@@ -162,17 +162,19 @@ impl Executor {
         let pump = PumpFun::new(trading_kp.clone(), cluster);
 
         let jito = if cfg.jito.enabled {
-            let c = JitoClient::new(
+            let c = JitoClient::new_with_percentile(
                 cfg.jito.endpoint.clone(),
                 cfg.jito.tip_lamports,
                 cfg.jito.tip_max_lamports,
+                cfg.jito.dynamic_tip_percentile,
             ).context("init jito client")?;
             tracing::info!(
                 endpoint=%cfg.jito.endpoint,
-                tip_lamports=cfg.jito.tip_lamports,
+                tip_floor_lamports=cfg.jito.tip_lamports,
                 tip_max_lamports=cfg.jito.tip_max_lamports,
+                dynamic_tip_percentile=cfg.jito.dynamic_tip_percentile,
                 dual_submit=cfg.jito.dual_submit,
-                "⚡ Jito Block Engine ENABLED"
+                "⚡ Jito Block Engine ENABLED (dynamic tip)"
             );
             Some(c)
         } else {

@@ -47,6 +47,14 @@ pub struct Jito {
     #[serde(default = "default_jito_tip_max_lamports")]
     pub tip_max_lamports: u64,
 
+    /// Target percentile of recent LANDED tips (from Jito's tip_floor
+    /// endpoint) the dynamic refresher aims for. Default p75 — above the
+    /// auction floor most of the time without paying p95+ MEV-sniper rates.
+    /// Effective tip per bundle = max(tip_lamports, dynamic_percentile).min(tip_max_lamports).
+    /// Live data 2026-05-13: p25≈1.1k, p50≈2.5k, p75≈5k, p95≈100k lamports.
+    #[serde(default = "default_jito_dynamic_tip_percentile")]
+    pub dynamic_tip_percentile: u8,
+
     /// When true, also submit every tx to the regular Helius/RPC path in
     /// parallel. Recommended: TRUE. Insurance against Jito outages.
     /// When false, ONLY Jito is tried — misses every trade if Jito is down.
@@ -56,8 +64,9 @@ pub struct Jito {
 
 fn default_jito_enabled() -> bool { false }
 fn default_jito_endpoint() -> String { "https://mainnet.block-engine.jito.wtf".to_string() }
-fn default_jito_tip_lamports() -> u64 { 100_000 }
+fn default_jito_tip_lamports() -> u64 { 5_000 }   // floor; raised 2026-05-13 from 100_000 stale default to match real p25 of Jito tip_floor. Dynamic refresher overrides up to p75.
 fn default_jito_tip_max_lamports() -> u64 { 2_000_000 }
+fn default_jito_dynamic_tip_percentile() -> u8 { 75 }
 fn default_jito_dual_submit() -> bool { true }
 
 impl Default for Jito {
@@ -67,6 +76,7 @@ impl Default for Jito {
             endpoint: default_jito_endpoint(),
             tip_lamports: default_jito_tip_lamports(),
             tip_max_lamports: default_jito_tip_max_lamports(),
+            dynamic_tip_percentile: default_jito_dynamic_tip_percentile(),
             dual_submit: default_jito_dual_submit(),
         }
     }
