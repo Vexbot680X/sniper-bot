@@ -51,11 +51,11 @@ position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_s
 live_max_position_sol = 0.001   # 🧪 DUST-TEST — matches dust-test position_size_sol.
 take_profit_pct = 11.0           # 🔒 LIVE 2026-05-12 16:44 — +11% target. On 0.10 SOL ($9.40) trade → ~$1 win (Mamba spec: 'take profits at $1+').
 stop_loss_pct = 5.0              # 🔒 LIVE 2026-05-12 — -5% tight stop.
-max_concurrent_positions = 1    # 🛡️ LIVE 2026-05-12 16:11 — REDUCED FROM 5. Safety throttle after multi-buy accounting bug observed in 15:34-15:36 UTC window (bot logged 1 trade, opened 6 on-chain).
+max_concurrent_positions = 1    # 🛡️ LIVE 2026-05-12 16:11 — REDUCED FROM 5. Race fix shipped 2026-05-13 (commit fd680dc) verified by unit tests; staying at 1 for dust validation.
 max_hold_seconds = 20           # 🔒 LIVE 2026-05-12 — 20s hold (tightened from 30s).
 # Rug exit: if open position's mcap collapses below this, force-close.
 # USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
-rug_exit_mcap_usd = 3700.0       # 🔒 LIVE 2026-05-12 16:11 — auto-exit at $3.7k (7.5% buffer below new $4k entry floor).
+rug_exit_mcap_usd = 3000.0       # 🧪 DUST-TEST 2026-05-13 — LOWERED from 3700. The old value was ABOVE min_market_cap_usd ($3500), meaning ANY entry at the $3500-$3700 band would trigger instant rug-exit on the next tick. The May 12 LIVE config inherited this bug after Mamba lowered min_market_cap_usd from $4000 to $3500 without lowering rug_exit. New value of $3000 gives a ~14% buffer below the entry floor.
 rug_exit_mcap_sol = 0.0         # legacy SOL floor, disabled when rug_exit_mcap_usd > 0
 
 # 🛡️ SAFETY (Phase 3.Safety.1): book↔chain reconciliation guard.

@@ -320,11 +320,11 @@ pub async fn close_position_live(
     };
 
     let fill = if scale_out.enabled && scale_out.tranches > 1 {
-        info!(%mint, symbol=%pos.symbol, tranches=scale_out.tranches, delay_ms=scale_out.delay_ms,
+        info!(%mint, symbol=%pos.symbol, reason=%reason, tranches=scale_out.tranches, delay_ms=scale_out.delay_ms,
               "🔴 LIVE: submitting scale-out sell");
         executor.sell_scale_out(mint, scale_out.tranches, scale_out.delay_ms).await?
     } else {
-        info!(%mint, symbol=%pos.symbol, "🔴 LIVE: submitting single-shot sell");
+        info!(%mint, symbol=%pos.symbol, reason=%reason, "🔴 LIVE: submitting single-shot sell");
         executor.sell_all(mint).await?
     };
     let actual_sol_received = fill.sol_received_lamports as f64 / 1e9;
