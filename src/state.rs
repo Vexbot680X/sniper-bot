@@ -71,6 +71,19 @@ pub struct Position {
     /// for THIS position, surviving restarts and bot reconnects.
     #[serde(default)]
     pub dev_pubkey: Option<String>,
+    /// PAPER-MODE SIM: bonding-curve virtual_sol depth at the moment we entered
+    /// this position. Captured from the PumpPortal NewToken event
+    /// (`vSolInBondingCurve` field) at entry time. Drives the paper-mode
+    /// slippage simulator on both buy and sell sides so paper PnL approximates
+    /// live reality.
+    ///
+    /// `None` for legacy positions opened before this field existed, or when
+    /// v_sol wasn't available from the event — the simulator falls back to a
+    /// conservative 30 SOL default. Not currently used by live-mode code
+    /// paths (live uses the real on-chain executor), but populated in live
+    /// mode too for consistency / forensic value.
+    #[serde(default)]
+    pub curve_sol_at_entry: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -247,6 +260,7 @@ mod tests {
             stop_loss_price: 0.9,
             max_hold_until: chrono::Utc::now() + chrono::Duration::seconds(60),
             dev_pubkey: None,
+            curve_sol_at_entry: None,
         }
     }
 

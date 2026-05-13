@@ -1,4 +1,8 @@
 use crate::executor::Executor;
+use crate::paper_slippage::{
+    apply_entry_slippage, apply_exit_slippage, total_fees_lamports,
+    PUMP_FUN_TRADE_FEE_BPS, SlippageOpts,
+};
 use crate::state::{Position, State};
 use crate::storage::{Db, TradeRecord};
 use chrono::{Duration, Utc};
@@ -26,10 +30,29 @@ pub fn evaluate_exit(pos: &Position, current_price: f64) -> ExitDecision {
 
 /// PAPER-mode position open. Pure bookkeeping — no on-chain calls.
 ///
+/// When `slippage_enabled` is TRUE, the simulator applies curve-depth
+/// slippage + pump.fun's 1% trade fee + Solana/Helius lamport fees so the
+/// number of tokens the position thinks it bought matches what would have
+/// happened on-chain. `entry_price_usd` is anchored to the QUOTED price so
+/// TP/SL/timeout triggers continue to fire off the strategy-decided level,
+/// not the post-slippage fill (same pattern as `open_position_live`).
+///
+/// When `slippage_enabled` is FALSE, the math collapses to the legacy zero-
+/// slippage path: `tokens_held = size_usd / entry_price`, exactly matching
+/// the pre-simulator build bit-for-bit.
+///
 /// `dev_pubkey` is the authoritative dev/creator pubkey for the position's
 /// mint. In paper mode it's typically the PumpPortal `traderPublicKey`
 /// (initial buyer); None when that wasn't available. Persisted on the
 /// Position so Feature.5's rug-watcher can attach to it later.
+///
+/// `curve_sol_at_entry` is the bonding curve's virtual_sol depth at the
+/// moment of entry (from PumpPortal's `vSolInBondingCurve`). Drives the
+/// slippage simulator; `None` falls back to a conservative 30 SOL default.
+///
+/// `position_size_sol` and `sol_usd` are required so the simulator can
+/// compute SOL-denominated curve impact and convert lamport-denominated
+/// fees to USD. Both are no-ops when `slippage_enabled` is FALSE.
 pub fn open_position_paper(
     state: &mut State,
     mint: String,
@@ -40,8 +63,38 @@ pub fn open_position_paper(
     size_usd: f64,
     max_hold_seconds: u64,
     dev_pubkey: Option<String>,
+    curve_sol_at_entry: Option<f64>,
+    position_size_sol: f64,
+    sol_usd: f64,
+    slippage_enabled: bool,
 ) -> Position {
-    let tokens = size_usd / entry_price;
+    let tokens = if slippage_enabled {
+        // 1. Curve-depth slippage on the buy — fills HIGHER than quoted.
+        let opts = SlippageOpts {
+            curve_sol: curve_sol_at_entry.unwrap_or(0.0), // sanitized inside
+            scale_out_tranches: 1, // buys are always single-shot
+        };
+        let effective_entry_price = apply_entry_slippage(entry_price, position_size_sol, &opts);
+
+        // 2. Pump.fun 1% trade fee + Solana/Helius lamport fees reduce the
+        //    effective USD capital that buys tokens. We leave the position's
+        //    `size_usd` (cost basis) at the full requested amount so PnL
+        //    naturally subtracts these costs at close time.
+        let pump_fee_frac = PUMP_FUN_TRADE_FEE_BPS as f64 / 10_000.0;
+        let lamport_fee_usd = if sol_usd > 0.0 {
+            (total_fees_lamports() as f64 / 1e9) * sol_usd
+        } else { 0.0 };
+        let effective_capital = (size_usd * (1.0 - pump_fee_frac)) - lamport_fee_usd;
+        let effective_capital = effective_capital.max(0.0);
+        if effective_entry_price > 0.0 {
+            effective_capital / effective_entry_price
+        } else {
+            0.0
+        }
+    } else {
+        // Legacy zero-slippage path. Bit-for-bit equivalent to pre-simulator.
+        size_usd / entry_price
+    };
     let pos = Position {
         id: Uuid::new_v4().to_string(),
         mint: mint.clone(),
@@ -54,6 +107,7 @@ pub fn open_position_paper(
         stop_loss_price: entry_price * (1.0 - sl_pct / 100.0),
         max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
         dev_pubkey,
+        curve_sol_at_entry,
     };
     state.bankroll_usd -= size_usd; // earmark
     state.open_positions.insert(mint, pos.clone());
@@ -111,6 +165,9 @@ pub async fn open_position_live(
         stop_loss_price: quoted_entry_price_usd * (1.0 - sl_pct / 100.0),
         max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
         dev_pubkey,
+        // Live mode uses the real executor for fills, not the paper simulator;
+        // this field is informational only for live positions.
+        curve_sol_at_entry: None,
     };
 
     {
@@ -138,6 +195,18 @@ pub struct CloseResult {
 }
 
 /// PAPER-mode close. Pure bookkeeping.
+///
+/// When `slippage_enabled` is TRUE, the simulator applies curve-depth
+/// slippage (per-tranche when scale-out is on) + pump.fun's 1% sell-side fee
+/// + Solana/Helius lamport fees to the exit value. `position_size_sol` is
+/// the SOL value of the WHOLE position being sold (the simulator divides by
+/// tranche count internally). The combined `fees_lamports` recorded on the
+/// TradeRecord sums entry + exit lamport-side fees and the lamport equivalent
+/// of both pump.fun 1% trade fees.
+///
+/// When `slippage_enabled` is FALSE, math collapses to the legacy zero-
+/// slippage path: `exit_value = tokens_held * exit_price`, exactly matching
+/// the pre-simulator build bit-for-bit. `fees_lamports` is 0 in that path.
 pub fn close_position_paper(
     state: &mut State,
     db: &Db,
@@ -145,10 +214,48 @@ pub fn close_position_paper(
     exit_price: f64,
     reason: &str,
     skim_pct: f64,
+    position_size_sol: f64,
+    sol_usd: f64,
+    scale_out_tranches: u8,
+    slippage_enabled: bool,
 ) -> anyhow::Result<CloseResult> {
     let pos = state.open_positions.remove(mint)
         .ok_or_else(|| anyhow::anyhow!("position not found: {mint}"))?;
-    let exit_value = pos.tokens_held * exit_price;
+
+    let (exit_value, fees_lamports) = if slippage_enabled {
+        // 1. Curve-depth slippage on the sell — fills LOWER than quoted, and
+        //    scale-out cuts per-tranche size.
+        let opts = SlippageOpts {
+            curve_sol: pos.curve_sol_at_entry.unwrap_or(0.0), // sanitized inside
+            scale_out_tranches: scale_out_tranches.max(1),
+        };
+        let effective_exit_price = apply_exit_slippage(exit_price, position_size_sol, &opts);
+        let gross_exit_value = pos.tokens_held * effective_exit_price;
+
+        // 2. Pump.fun 1% sell-side fee + Solana/Helius lamport fees.
+        let pump_fee_frac = PUMP_FUN_TRADE_FEE_BPS as f64 / 10_000.0;
+        let pump_fee_exit_usd = gross_exit_value * pump_fee_frac;
+        let lamport_fee_exit_usd = if sol_usd > 0.0 {
+            (total_fees_lamports() as f64 / 1e9) * sol_usd
+        } else { 0.0 };
+        let net_exit = (gross_exit_value - pump_fee_exit_usd - lamport_fee_exit_usd).max(0.0);
+
+        // 3. Total fees recorded in lamports: 2 × lamport-side fees (entry +
+        //    exit) plus the lamport equivalents of both pump.fun 1% fees
+        //    (entry + exit). The entry pump fee was charged against
+        //    pos.size_usd at open time; we reconstruct it here using the
+        //    same ratio for the trade record.
+        let pump_fee_entry_usd = pos.size_usd * pump_fee_frac;
+        let pump_fees_usd_total = pump_fee_entry_usd + pump_fee_exit_usd;
+        let pump_fees_lamports = if sol_usd > 0.0 {
+            ((pump_fees_usd_total / sol_usd) * 1e9) as i64
+        } else { 0 };
+        let lamport_fees_total = 2 * total_fees_lamports() as i64;
+        (net_exit, lamport_fees_total + pump_fees_lamports)
+    } else {
+        (pos.tokens_held * exit_price, 0_i64)
+    };
+
     let pnl_usd = exit_value - pos.size_usd;
     let pnl_pct = (pnl_usd / pos.size_usd) * 100.0;
     state.bankroll_usd += exit_value; // return capital + pnl
@@ -171,7 +278,7 @@ pub fn close_position_paper(
                 mode: "paper".to_string(),
                 entry_sig: None,
                 exit_sig: None,
-                fees_lamports: 0,
+                fees_lamports,
             };
             db.record_trade(&rec).ok();
             CloseResult { trade: rec, skimmed_usd, sell_signature: None, skim_signature: None }
@@ -390,6 +497,7 @@ mod tests {
             stop_loss_price:  entry * (1.0 - sl / 100.0),
             max_hold_until: Utc::now() + chrono::Duration::seconds(hold_secs),
             dev_pubkey: None,
+            curve_sol_at_entry: None,
         }
     }
 
@@ -418,10 +526,33 @@ mod tests {
         assert_eq!(evaluate_exit(&p, 1.05).reason, "timeout");
     }
 
+    /// Helper: legacy zero-slippage open. Preserves the pre-simulator call
+    /// shape so existing assertions keep their meaning bit-for-bit.
+    fn open_legacy(s: &mut State, mint: &str, entry: f64, size: f64) -> Position {
+        open_position_paper(
+            s, mint.into(), "SYM".into(),
+            entry, 20.0, 10.0, size, 300,
+            None,
+            /*curve_sol*/ None, /*position_size_sol*/ 0.0, /*sol_usd*/ 0.0,
+            /*slippage_enabled*/ false,
+        )
+    }
+
+    /// Helper: legacy zero-slippage close.
+    fn close_legacy(
+        s: &mut State, db: &Db, mint: &str, exit: f64, reason: &str, skim_pct: f64,
+    ) -> anyhow::Result<CloseResult> {
+        close_position_paper(
+            s, db, mint, exit, reason, skim_pct,
+            /*position_size_sol*/ 0.0, /*sol_usd*/ 0.0,
+            /*scale_out_tranches*/ 1, /*slippage_enabled*/ false,
+        )
+    }
+
     #[test]
     fn paper_open_decrements_bankroll_and_inserts() {
         let mut s = State::fresh(500.0);
-        let p = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300, None);
+        let p = open_legacy(&mut s, "MINT", 1.0, 18.0);
         assert!((s.bankroll_usd - 482.0).abs() < 1e-9);
         assert_eq!(p.tokens_held, 18.0);
         assert!((p.take_profit_price - 1.20).abs() < 1e-9);
@@ -435,9 +566,9 @@ mod tests {
         // Exit value = 18 * 1.20 = 21.60. PnL = 3.60. Skim 50% = 1.80.
         let db = crate::storage::Db::open(":memory:").unwrap();
         let mut s = State::fresh(500.0);
-        let _ = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300, None);
+        let _ = open_legacy(&mut s, "MINT", 1.0, 18.0);
         // After open: bankroll = 482
-        let cr = close_position_paper(&mut s, &db, "MINT", 1.20, "take_profit", 50.0).unwrap();
+        let cr = close_legacy(&mut s, &db, "MINT", 1.20, "take_profit", 50.0).unwrap();
         // bankroll back: 482 + 21.60 = 503.60, then -1.80 skim = 501.80
         assert!((s.bankroll_usd - 501.80).abs() < 1e-6, "bankroll = {}", s.bankroll_usd);
         assert!((s.vault_usd - 1.80).abs() < 1e-6);
@@ -449,11 +580,180 @@ mod tests {
     fn paper_close_no_skim_on_loss() {
         let db = crate::storage::Db::open(":memory:").unwrap();
         let mut s = State::fresh(500.0);
-        let _ = open_position_paper(&mut s, "MINT".into(), "SYM".into(), 1.0, 20.0, 10.0, 18.0, 300, None);
-        let cr = close_position_paper(&mut s, &db, "MINT", 0.90, "stop_loss", 50.0).unwrap();
+        let _ = open_legacy(&mut s, "MINT", 1.0, 18.0);
+        let cr = close_legacy(&mut s, &db, "MINT", 0.90, "stop_loss", 50.0).unwrap();
         // PnL = 18 * 0.9 - 18 = -1.8. No skim on loss.
         assert!((cr.skimmed_usd).abs() < 1e-9);
         assert!((s.vault_usd).abs() < 1e-9);
         assert_eq!(s.stats.losses, 1);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // Paper slippage + fee simulator tests (Phase 3 paper-validation gate).
+    // ───────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn paper_open_with_slippage_disabled_matches_legacy_exactly() {
+        // The `slippage_enabled = false` path is the historical zero-slippage
+        // formula. Same inputs must produce bit-for-bit-identical state.
+        let mut s_legacy = State::fresh(500.0);
+        let p_legacy = open_position_paper(
+            &mut s_legacy, "M".into(), "S".into(),
+            1.0, 20.0, 10.0, 18.0, 300, None,
+            /*curve_sol*/ Some(30.0), /*position_size_sol*/ 0.1, /*sol_usd*/ 95.0,
+            /*slippage_enabled*/ false,
+        );
+        // Bankroll, tokens, prices: identical to historic open_position_paper.
+        assert!((s_legacy.bankroll_usd - 482.0).abs() < 1e-12);
+        assert_eq!(p_legacy.tokens_held, 18.0);
+        assert!((p_legacy.take_profit_price - 1.20).abs() < 1e-12);
+        assert!((p_legacy.stop_loss_price - 0.90).abs() < 1e-12);
+    }
+
+    #[test]
+    fn paper_full_cycle_with_slippage_disabled_matches_legacy() {
+        // End-to-end: bit-for-bit-equivalent bankroll + PnL when flag is off.
+        // 18 USD position, +20% quote-to-quote should yield the same +$3.60
+        // gross PnL the pre-simulator build had.
+        let db = crate::storage::Db::open(":memory:").unwrap();
+        let mut s = State::fresh(500.0);
+        open_position_paper(
+            &mut s, "M".into(), "S".into(),
+            1.0, 20.0, 10.0, 18.0, 300, None,
+            Some(30.0), 0.1, 95.0, false,
+        );
+        let cr = close_position_paper(
+            &mut s, &db, "M", 1.20, "take_profit", 50.0,
+            0.1, 95.0, 3, false,
+        ).unwrap();
+        // 18 * 1.20 = 21.60. PnL = 3.60. Skim 50% = 1.80. Bankroll = 482 + 21.60 - 1.80.
+        assert!((cr.trade.pnl_usd - 3.60).abs() < 1e-9, "pnl_usd={}", cr.trade.pnl_usd);
+        assert!((s.bankroll_usd - 501.80).abs() < 1e-9);
+        assert_eq!(cr.trade.fees_lamports, 0, "flag-off path must record zero fees");
+    }
+
+    #[test]
+    fn paper_open_with_slippage_buys_fewer_tokens() {
+        // 0.1 SOL position on a 30 SOL curve at $95/SOL:
+        //   entry_slippage = 0.1/30 * 1.3 = 0.004333…  → effective_entry = 1.004333…
+        //   pump fee = 1%                          → 99% of size_usd buys
+        //   lamport_fee = 0.0006 SOL * $95         → $0.057
+        //   effective_capital = (9.5 * 0.99) - 0.057 = 9.348
+        //   tokens = 9.348 / 1.004333 ≈ 9.3077
+        let mut s = State::fresh(500.0);
+        let p = open_position_paper(
+            &mut s, "M".into(), "S".into(),
+            1.0, 20.0, 10.0, /*size_usd*/ 9.5, 300, None,
+            Some(30.0), /*pos_sol*/ 0.1, /*sol_usd*/ 95.0,
+            /*slippage_enabled*/ true,
+        );
+        // Math: same as comment above.
+        let expected_eff_entry = 1.0 * (1.0 + 0.1 / 30.0 * 1.3);
+        let lamport_fee_usd = (600_000.0 / 1e9) * 95.0;
+        let effective_capital = (9.5 * 0.99) - lamport_fee_usd;
+        let expected_tokens = effective_capital / expected_eff_entry;
+        assert!((p.tokens_held - expected_tokens).abs() < 1e-9,
+                "tokens={} expected={}", p.tokens_held, expected_tokens);
+        // entry_price_usd remains anchored to QUOTED entry (TP/SL math stays sane).
+        assert!((p.entry_price_usd - 1.0).abs() < 1e-12);
+        // Bankroll deducts the full requested size_usd (cost basis).
+        assert!((s.bankroll_usd - (500.0 - 9.5)).abs() < 1e-12);
+        // curve_sol_at_entry was captured for use at close time.
+        assert_eq!(p.curve_sol_at_entry, Some(30.0));
+    }
+
+    #[test]
+    fn paper_scale_out_3_tranches_beats_single_shot() {
+        // Same position closed at the same quoted exit price under:
+        //   (a) single-shot, 1 tranche
+        //   (b) 3-tranche scale-out
+        // (b) must yield a higher exit value because per-tranche slippage is 1/3.
+        let db = crate::storage::Db::open(":memory:").unwrap();
+
+        let mut s_a = State::fresh(500.0);
+        open_position_paper(
+            &mut s_a, "M".into(), "S".into(),
+            1.0, 30.0, 5.0, 9.5, 300, None,
+            Some(30.0), 0.1, 95.0, true,
+        );
+        let cr_a = close_position_paper(
+            &mut s_a, &db, "M", 1.30, "take_profit", 0.0,
+            0.1, 95.0, /*tranches*/ 1, true,
+        ).unwrap();
+
+        let mut s_b = State::fresh(500.0);
+        open_position_paper(
+            &mut s_b, "M".into(), "S".into(),
+            1.0, 30.0, 5.0, 9.5, 300, None,
+            Some(30.0), 0.1, 95.0, true,
+        );
+        let cr_b = close_position_paper(
+            &mut s_b, &db, "M", 1.30, "take_profit", 0.0,
+            0.1, 95.0, /*tranches*/ 3, true,
+        ).unwrap();
+
+        assert!(
+            cr_b.trade.pnl_usd > cr_a.trade.pnl_usd,
+            "3-tranche pnl ({}) must beat single-shot pnl ({})",
+            cr_b.trade.pnl_usd, cr_a.trade.pnl_usd,
+        );
+    }
+
+    #[test]
+    fn paper_exit_records_both_sides_in_fees_lamports() {
+        // Both pump.fun trade fees (entry + exit) plus 2× lamport-side fees
+        // (entry + exit) must land in the TradeRecord.
+        let db = crate::storage::Db::open(":memory:").unwrap();
+        let mut s = State::fresh(500.0);
+        open_position_paper(
+            &mut s, "M".into(), "S".into(),
+            1.0, 30.0, 5.0, 9.5, 300, None,
+            Some(30.0), 0.1, 95.0, true,
+        );
+        let cr = close_position_paper(
+            &mut s, &db, "M", 1.30, "take_profit", 0.0,
+            0.1, 95.0, 1, true,
+        ).unwrap();
+
+        // Sanity: fees_lamports is positive and includes 2× lamport-fees-per-side
+        // as a lower bound (it's actually bigger — also includes pump.fun fees
+        // converted to lamports).
+        let lamport_fees_floor = 2 * 600_000_i64;
+        assert!(
+            cr.trade.fees_lamports > lamport_fees_floor,
+            "fees_lamports {} must be > {} (lamport-side floor)",
+            cr.trade.fees_lamports, lamport_fees_floor,
+        );
+    }
+
+    #[test]
+    fn paper_137pct_quote_move_with_slippage_realistic() {
+        // The Dritan trade: 0.1 SOL position, 30 SOL curve, 3-tranche scale-out,
+        // +137% quote-to-quote price move. Without slippage paper PnL would be
+        // +137% — with slippage the realized PnL should be substantially lower
+        // (somewhere in the +40-130% band; we don't pin a tight number, just
+        // assert it's both POSITIVE and LESS than the naive quote-to-quote.).
+        let db = crate::storage::Db::open(":memory:").unwrap();
+        let mut s = State::fresh(500.0);
+        let entry = 1.0;
+        let exit = entry * 2.37; // +137%
+        let size_usd = 9.5; // 0.1 SOL @ $95/SOL
+        open_position_paper(
+            &mut s, "M".into(), "S".into(),
+            entry, 30.0, 5.0, size_usd, 300, None,
+            Some(30.0), 0.1, 95.0, true,
+        );
+        let cr = close_position_paper(
+            &mut s, &db, "M", exit, "take_profit", 0.0,
+            0.1, 95.0, 3, true,
+        ).unwrap();
+        // The naive zero-slippage PnL would be size_usd * 1.37 = $13.015.
+        let naive_pnl = size_usd * 1.37;
+        assert!(cr.trade.pnl_usd > 0.0, "realistic PnL still profitable");
+        assert!(
+            cr.trade.pnl_usd < naive_pnl,
+            "realistic PnL ({}) must be less than naive zero-slippage PnL ({})",
+            cr.trade.pnl_usd, naive_pnl,
+        );
     }
 }

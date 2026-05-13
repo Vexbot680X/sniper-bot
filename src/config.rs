@@ -11,6 +11,86 @@ pub struct Config {
     pub storage: Storage,
     #[serde(default)]
     pub skim: Skim,
+    #[serde(default)]
+    pub paper: Paper,
+    #[serde(default)]
+    pub jito: Jito,
+}
+
+/// Jito Block Engine integration. When `enabled = true`, every live tx is
+/// also submitted to Jito as a 1-tx bundle with a tip transfer prepended.
+/// We dual-submit: Helius (existing) + Jito (new) in parallel; Solana's
+/// signature dedup means only one inclusion can land. See `src/jito.rs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Jito {
+    /// Master switch. Default FALSE — existing live setups keep current behavior.
+    /// Flip to true after dust-testing.
+    #[serde(default = "default_jito_enabled")]
+    pub enabled: bool,
+
+    /// Block Engine HTTP endpoint. Regional endpoints exist (amsterdam.,
+    /// frankfurt., ny., tokyo., slc.) for ~50-150ms lower latency once you
+    /// know your nearest. The default global endpoint auto-routes.
+    #[serde(default = "default_jito_endpoint")]
+    pub endpoint: String,
+
+    /// Tip per tx in lamports. 1 lamport = 1e-9 SOL. Reference:
+    ///   100_000  = 0.0001 SOL ≈ $0.01 (conservative scalp tier)
+    ///   500_000  = 0.0005 SOL ≈ $0.05 (competitive)
+    /// 1_000_000  = 0.001  SOL ≈ $0.10 (aggressive, high-comp moments)
+    /// Default = 100k = cheap baseline.
+    #[serde(default = "default_jito_tip_lamports")]
+    pub tip_lamports: u64,
+
+    /// Hard cap: refuse to start if `tip_lamports > tip_max_lamports`.
+    /// Belt + suspenders against config typos. Default 2M = $0.20.
+    #[serde(default = "default_jito_tip_max_lamports")]
+    pub tip_max_lamports: u64,
+
+    /// When true, also submit every tx to the regular Helius/RPC path in
+    /// parallel. Recommended: TRUE. Insurance against Jito outages.
+    /// When false, ONLY Jito is tried — misses every trade if Jito is down.
+    #[serde(default = "default_jito_dual_submit")]
+    pub dual_submit: bool,
+}
+
+fn default_jito_enabled() -> bool { false }
+fn default_jito_endpoint() -> String { "https://mainnet.block-engine.jito.wtf".to_string() }
+fn default_jito_tip_lamports() -> u64 { 100_000 }
+fn default_jito_tip_max_lamports() -> u64 { 2_000_000 }
+fn default_jito_dual_submit() -> bool { true }
+
+impl Default for Jito {
+    fn default() -> Self {
+        Self {
+            enabled: default_jito_enabled(),
+            endpoint: default_jito_endpoint(),
+            tip_lamports: default_jito_tip_lamports(),
+            tip_max_lamports: default_jito_tip_max_lamports(),
+            dual_submit: default_jito_dual_submit(),
+        }
+    }
+}
+
+/// Paper-mode-specific knobs. Live mode ignores this whole section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Paper {
+    /// When TRUE (default), apply curve-depth slippage + 1% pump.fun fee +
+    /// lamport-denominated tx/priority fees to paper buys and sells so paper
+    /// PnL approximates live reality. When FALSE, paper trades fill at the
+    /// quoted price with zero slippage and zero fees (legacy behavior, bit-
+    /// for-bit-equivalent to the pre-simulator build — used for A/B and unit
+    /// testing).
+    #[serde(default = "default_paper_slippage_enabled")]
+    pub slippage_enabled: bool,
+}
+
+fn default_paper_slippage_enabled() -> bool { true }
+
+impl Default for Paper {
+    fn default() -> Self {
+        Self { slippage_enabled: default_paper_slippage_enabled() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

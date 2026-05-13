@@ -8,6 +8,7 @@
 //! still correct).
 
 use crate::config::Config;
+use crate::jito::JitoClient;
 use crate::pump_ix;
 use crate::rpc::Rpc;
 use crate::wallet;
@@ -102,6 +103,10 @@ pub struct Executor {
     pub pump: PumpFun,
     pub slippage_bps: u64,
     pub priority_fee_percentile: u8,
+    /// Optional Jito Block Engine client. When Some, every tx is dual-submitted
+    /// to Jito (as a [tip_tx, trade_tx] bundle) AND Helius in parallel; whichever
+    /// confirms first wins via Solana's signature dedup.
+    pub jito: Option<JitoClient>,
 }
 
 impl Executor {
@@ -147,6 +152,25 @@ impl Executor {
         );
         let pump = PumpFun::new(trading_kp.clone(), cluster);
 
+        let jito = if cfg.jito.enabled {
+            let c = JitoClient::new(
+                cfg.jito.endpoint.clone(),
+                cfg.jito.tip_lamports,
+                cfg.jito.tip_max_lamports,
+            ).context("init jito client")?;
+            tracing::info!(
+                endpoint=%cfg.jito.endpoint,
+                tip_lamports=cfg.jito.tip_lamports,
+                tip_max_lamports=cfg.jito.tip_max_lamports,
+                dual_submit=cfg.jito.dual_submit,
+                "⚡ Jito Block Engine ENABLED"
+            );
+            Some(c)
+        } else {
+            tracing::info!("🔵 Jito disabled (cfg.jito.enabled = false). Tx submission via Helius only.");
+            None
+        };
+
         Ok(Self {
             trading_kp,
             vault_pubkey,
@@ -155,6 +179,7 @@ impl Executor {
             pump,
             slippage_bps: (cfg.trading.slippage_bps as u64).max(1),
             priority_fee_percentile: cfg.trading.priority_fee_percentile,
+            jito,
         })
     }
 
@@ -389,6 +414,12 @@ impl Executor {
 
     /// Submit a pre-signed VersionedTransaction (used for PumpPortal-built txs).
     /// Same simulate-before-submit guardrail and on-chain log capture as `send_ixs`.
+    ///
+    /// When `self.jito.is_some()` and `dual_submit = true`, ALSO submits the
+    /// tx via a Jito bundle ([tip_tx, this_tx]) in parallel. Solana dedups by
+    /// signature, so only one inclusion can land; whichever block engine wins,
+    /// the other becomes a no-op. If Helius wins, the Jito bundle is dropped
+    /// and we pay no tip. Logs winner via `tracing::info` for measurement.
     async fn send_versioned_tx(&self, tx: &solana_sdk::transaction::VersionedTransaction) -> Result<Signature> {
         // Pre-flight simulate.
         let sim_cfg = RpcSimulateTransactionConfig {
@@ -408,6 +439,45 @@ impl Executor {
             let logs = sim.value.logs.unwrap_or_default().join("\n");
             return Err(anyhow!("pre-send simulate failed: {err:?}\n{logs}"));
         }
+
+        // ⚡ Optional Jito parallel-submit. Build a [tip_tx, trade_tx] bundle
+        // and fire it concurrently with the Helius send. Tip tx and trade tx
+        // share the same blockhash window so Jito can include them in one block.
+        // Failures are non-fatal: we always run the Helius path.
+        if let Some(jito) = &self.jito {
+            // Fetch latest blockhash for the tip tx. Cheap call.
+            let blockhash_res = self.rpc.client
+                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+                .await;
+            match blockhash_res {
+                Ok((bh, _)) => {
+                    match jito.build_tip_tx(&self.trading_kp, bh) {
+                        Ok(tip_tx) => {
+                            let bundle = vec![tip_tx, tx.clone()];
+                            let jito_client = jito.clone();
+                            let trade_sig = tx.signatures.first().copied();
+                            // Fire and forget — Helius path runs below and is the
+                            // authoritative confirmation. Bundle id is logged for
+                            // post-hoc analysis (which path won which trade).
+                            tokio::spawn(async move {
+                                let res = jito_client.send_bundle_best_effort(&bundle).await;
+                                if let Some(bid) = res {
+                                    tracing::info!(
+                                        bundle_id=%bid,
+                                        trade_sig=?trade_sig,
+                                        tip_lamports=jito_client.tip_lamports(),
+                                        "⚡ jito bundle submitted (parallel to helius)"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!(error=%e, "jito build_tip_tx failed; helius-only this trade"),
+                    }
+                }
+                Err(e) => tracing::warn!(error=%e, "jito get_latest_blockhash failed; helius-only this trade"),
+            }
+        }
+
         let send_res = self.rpc.client
             .send_and_confirm_transaction_with_spinner_and_commitment(
                 tx,

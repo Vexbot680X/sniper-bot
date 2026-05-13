@@ -1,6 +1,6 @@
-# sniper-bot config — paper trading mode
+# sniper-bot config — LIVE mode
 [trading]
-mode = "live"                   # paper | live  — flipped LIVE 2026-05-10 13:33 UTC by Mamba on Helius Developer tier upgrade. Paper run history: 929 trades, +$2,133, 32% WR. May 9 live attempt: 5/5 timeouts, -$208 on free Helius. New attempt with Developer tier + safer position cap (0.05 SOL = ~$4.50/trade).
+mode = "live"                    # paper | live  — LIVE 2026-05-12 14:44 UTC by Mamba. $100 reload, strategy: 0.05 SOL/trade at $3-3.5k mcap band, TP 30 / SL 5 / 20s hold / rug<$3k. Session caps (enforced by Vex out-of-band): -$30 hard stop, 50-trade recap pause.
 # Live execution requires SNIPER_WALLET_PATH (default ~/.openclaw/workspace/secrets/sniper-bot-wallet.json)
 # and VAULT_WALLET_PATH (default ~/.openclaw/workspace/secrets/vault-wallet.json) plus HELIUS_API_KEY env vars.
 # DO NOT flip to live without reviewing LIVE_BUILD_REPORT.md and dust-testing first.
@@ -13,21 +13,21 @@ priority_fee_percentile = 75    # 75th percentile of recent priority fees
 # 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
 # to 0.005 per PHASE_3_PLAN.md — smaller positions = smaller fee drag relative
 # to rug-detection edge, AND smaller blast radius for any safety feature bug.
-position_size_sol = 0.005       # ~$0.47 per trade @ $95/SOL
+position_size_sol = 0.10        # 🔒 LIVE 2026-05-12 16:44 — 2x scale-up from 0.05. ~$9.40/trade. Targeting $1+ wins at +11% TP.
 position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
 
 # 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
 # The bot refuses any LIVE buy that would exceed this many SOL, regardless of
 # what position_size_sol or any other math says. Paper mode ignores this.
 # Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
-live_max_position_sol = 0.005   # 🛑 STRATEGY v5 2026-05-11 — matches position_size_sol.
-take_profit_pct = 30.0           # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — +33% mcap target ($3k→$4k entry band).
-stop_loss_pct = 5.0              # 🔒 STRATEGY v3 2026-05-10 17:51 UTC — lowered from 10 to cut losers FAST. Better -8% real fill than -35% timeout.
-max_concurrent_positions = 5
-max_hold_seconds = 30           # 🔒 STRATEGY v4 — 30s hold per Mamba spec.
+live_max_position_sol = 0.10    # 🛑 LIVE 2026-05-12 16:44 — matches new position_size_sol.
+take_profit_pct = 11.0           # 🔒 LIVE 2026-05-12 16:44 — +11% target. On 0.10 SOL ($9.40) trade → ~$1 win (Mamba spec: 'take profits at $1+').
+stop_loss_pct = 5.0              # 🔒 LIVE 2026-05-12 — -5% tight stop.
+max_concurrent_positions = 1    # 🛡️ LIVE 2026-05-12 16:11 — REDUCED FROM 5. Safety throttle after multi-buy accounting bug observed in 15:34-15:36 UTC window (bot logged 1 trade, opened 6 on-chain).
+max_hold_seconds = 20           # 🔒 LIVE 2026-05-12 — 20s hold (tightened from 30s).
 # Rug exit: if open position's mcap collapses below this, force-close.
 # USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
-rug_exit_mcap_usd = 2900.0       # 🔒 LIVE BOT RULES — exit if mcap drops below $2.9k (raised 2026-05-10 16:32 UTC by Mamba). Tighter rug-out to cut losers earlier.
+rug_exit_mcap_usd = 3700.0       # 🔒 LIVE 2026-05-12 16:11 — auto-exit at $3.7k (7.5% buffer below new $4k entry floor).
 rug_exit_mcap_sol = 0.0         # legacy SOL floor, disabled when rug_exit_mcap_usd > 0
 
 # 🛡️ SAFETY (Phase 3.Safety.1): book↔chain reconciliation guard.
@@ -50,7 +50,7 @@ pre_buy_fee_bps_per_side = 100         # pump.fun documented swap fee
 # a delay between each, instead of one big market sell. Reduces aggregate
 # exit slippage by ~40-60% at our band-scalp depth range. Each tranche
 # reads current balance so partial fills self-correct.
-scale_out_enabled = true
+scale_out_enabled = false  # 🔒 LIVE 2026-05-12 16:31 — DISABLED. Mamba wants single-order sells for speed. One sell tx = full size, faster exit, no tranche-3 race condition.
 scale_out_tranches = 3
 scale_out_delay_ms = 500
 
@@ -73,7 +73,7 @@ dev_vetting_max_launches_24h = 3
 # rug_watcher_alert_only = true (DEFAULT for Phase B initial validation)
 # Flip to false only after measuring false-positive rate on real data.
 rug_watcher_enabled = true
-rug_watcher_alert_only = true
+rug_watcher_alert_only = false  # 🔑 LIVE 2026-05-12 15:37 — AUTO-EXIT enabled (THE KILLER FEATURE). After ASST rug trade caught at 170ms in alert-only mode, Mamba flipped this to auto-sell on dev dump.
 
 [skim]
 # Continuous profit skim: on every winning close, move skim_pct of the realized
@@ -100,8 +100,8 @@ heartbeat_interval_seconds = 300
 #   460 SOL  (~$69k)   — graduation candidates only
 # Mcap floor: USD-denominated takes precedence when set; bot converts to SOL
 # at decision time using current sol_usd — always self-consistent.
-min_market_cap_usd = 3000.0      # 🔒 STRATEGY v4 2026-05-10 22:30 UTC — band-scalp entry FLOOR ($3k).
-max_market_cap_usd = 3500.0      # 🔒 STRATEGY v4 — band-scalp entry CEILING ($3.5k). Only buy in $3k-$3.5k mcap band.
+min_market_cap_usd = 3500.0      # 🔒 LIVE 2026-05-12 16:31 — lowered from $4k to get more trades firing. Still above old $3k band where we got rugged.
+max_market_cap_usd = 5000.0      # 🔒 LIVE 2026-05-12 — entry band ceiling.
 min_market_cap_sol = 0.0        # legacy SOL floor, disabled when min_market_cap_usd > 0
 require_mint_renounced = true
 require_no_freeze_authority = true
@@ -130,6 +130,24 @@ pumpportal_ws = "wss://pumpportal.fun/api/data"
 [telegram]
 # Set via env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 enabled = true
+
+# ⚡ Jito Block Engine integration. When enabled, every live tx is also
+# submitted to Jito as a [tip_tx, trade_tx] bundle in parallel with the
+# regular Helius submission. Solana dedups by signature — only one inclusion
+# can land. If Jito wins (typically faster), the tip is paid; if Helius wins,
+# the bundle is rejected and we pay no tip.
+#
+# Why dual-submit: Jito has had multi-hour outages. Helius parallel-path is
+# insurance against missed trades during Jito downtime.
+#
+# Cost math: 100k lamports = 0.0001 SOL ≈ $0.01 per trade. On 19 trades today
+# that would have been ~$0.20 total in tips.
+[jito]
+enabled = false                           # 🔴 default off — flip to true after dust-testing.
+endpoint = "https://mainnet.block-engine.jito.wtf"
+tip_lamports = 100_000                    # 0.0001 SOL = ~$0.01 (conservative)
+tip_max_lamports = 2_000_000              # hard cap: 0.002 SOL = ~$0.20 (refuses startup above)
+dual_submit = true                        # also submit to Helius. Recommended TRUE.
 
 [storage]
 db_path = "data/sniper.db"

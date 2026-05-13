@@ -5,6 +5,8 @@ pub mod bonding_curve;
 pub mod config;
 pub mod dev_watcher;
 pub mod executor;
+pub mod jito;
+pub mod paper_slippage;
 pub mod pump_ix;
 pub mod pumpportal_trade;
 pub mod rpc;

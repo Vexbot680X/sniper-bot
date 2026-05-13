@@ -800,6 +800,14 @@ async fn handle_new_token(
                 size_usd,
                 cfg.trading.max_hold_seconds,
                 resolved_dev_pubkey.clone(),
+                // Paper slippage sim: capture curve depth at entry +
+                // position size in SOL + current sol_usd so the close-side
+                // simulator has everything it needs. Flag-gated by
+                // `[paper] slippage_enabled` (default true).
+                Some(v_sol),
+                cfg.trading.position_size_sol,
+                sol_usd,
+                cfg.paper.slippage_enabled,
             )
         }
     };
@@ -1049,7 +1057,19 @@ async fn check_positions(
             }
             (None, _) => {
                 let mut s = state.lock().await;
-                positions::close_position_paper(&mut s, db, &mint, current, &dec.reason, cfg.skim.skim_pct)?
+                // Paper slippage sim: per-tranche slippage when scale-out is
+                // on, plus pump.fun 1% + Solana/Helius fees on the sell side.
+                // Flag-gated by `[paper] slippage_enabled` (default true).
+                let scale_out_tranches = if cfg.trading.scale_out_enabled {
+                    cfg.trading.scale_out_tranches
+                } else { 1 };
+                positions::close_position_paper(
+                    &mut s, db, &mint, current, &dec.reason, cfg.skim.skim_pct,
+                    cfg.trading.position_size_sol,
+                    sol_usd,
+                    scale_out_tranches,
+                    cfg.paper.slippage_enabled,
+                )?
             }
         };
 

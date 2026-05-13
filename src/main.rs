@@ -11,11 +11,13 @@ mod pumpportal;
 mod bonding_curve;
 mod dev_watcher;
 mod scanner;
+mod paper_slippage;
 mod positions;
 mod daemon;
 mod wallet;
 mod rpc;
 mod executor;
+mod jito;
 mod pump_ix;
 mod pumpportal_trade;
 
