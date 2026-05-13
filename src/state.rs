@@ -31,6 +31,22 @@ pub struct State {
     /// Not persisted across restarts — always starts empty.
     #[serde(skip)]
     pub live_in_flight: HashSet<String>,
+    /// 🛡️ RACE FIX (2026-05-13): mints whose slot has been RESERVED for entry
+    /// but where the buy hasn't yet inserted into `open_positions`. Without
+    /// this, two simultaneous PumpPortal events can BOTH pass the
+    /// `open_positions.len() < max_concurrent_positions` gate before either
+    /// writes — leading to N+1 open positions when N was configured as max.
+    ///
+    /// Inserted atomically at filter-pass time while holding the state lock.
+    /// Removed on every exit path:
+    ///   • after `open_positions.insert(...)` succeeds
+    ///   • when the buy errors out
+    ///   • when any post-reservation gate refuses entry
+    ///
+    /// Counted alongside `open_positions` in the concurrency check via
+    /// [`Self::reserved_slots`]. Not persisted (always starts empty).
+    #[serde(skip)]
+    pub pending_entries: HashSet<String>,
     /// LIVE-mode: mints with a sell-in-flight. Prevents duplicate sells when
     /// `check_positions` is invoked again (periodic timer or stale-poll fallback)
     /// while a previous close is still awaiting tx confirmation. The position
@@ -111,6 +127,7 @@ impl State {
             depletion_alert_sent: false,
             live_in_flight: HashSet::new(),
             live_selling: HashSet::new(),
+            pending_entries: HashSet::new(),
             mode: String::new(),
             live_consecutive_failures: 0,
         }
@@ -148,6 +165,37 @@ impl State {
     pub fn book_total_usd(&self) -> f64 {
         let open_value: f64 = self.open_positions.values().map(|p| p.size_usd).sum();
         self.bankroll_usd + self.vault_usd + open_value
+    }
+
+    /// 🛡️ RACE FIX: total slots currently occupied OR reserved.
+    /// = open_positions.len() + pending_entries.len()
+    ///
+    /// Use this (NOT bare `open_positions.len()`) when checking against
+    /// `max_concurrent_positions`. A position counts the moment its mint is
+    /// reserved at filter-pass time, before the buy returns.
+    pub fn reserved_slots(&self) -> usize {
+        self.open_positions.len() + self.pending_entries.len()
+    }
+
+    /// 🛡️ RACE FIX: atomically reserve a slot for `mint` if capacity allows.
+    ///
+    /// Must be called while holding the state lock. Returns `true` if the
+    /// slot was reserved (caller must call `release_entry_reservation` on
+    /// every exit path); `false` if `mint` is already open / reserved / over
+    /// capacity (caller bails out, no cleanup needed).
+    pub fn try_reserve_entry(&mut self, mint: &str, max_concurrent: usize) -> bool {
+        if self.open_positions.contains_key(mint) { return false; }
+        if self.pending_entries.contains(mint) { return false; }
+        if self.reserved_slots() >= max_concurrent { return false; }
+        self.pending_entries.insert(mint.to_string());
+        true
+    }
+
+    /// 🛡️ RACE FIX: release a previously-reserved slot. Idempotent: safe to
+    /// call on every exit path including success. Returns `true` if a
+    /// reservation actually existed (mostly useful for tests).
+    pub fn release_entry_reservation(&mut self, mint: &str) -> bool {
+        self.pending_entries.remove(mint)
     }
 
     /// SAFETY (Phase 3): reconciliation guard for live startup.
@@ -332,5 +380,103 @@ mod tests {
         assert!(s.check_reconciliation(100.0, 0.05).is_ok());
         // chain reports $50 (only bankroll+vault) → 50% divergence → FAIL
         assert!(s.check_reconciliation(50.0, 0.05).is_err());
+    }
+
+    // 🛡️ RACE FIX (2026-05-13) unit tests for try_reserve_entry / release_entry_reservation.
+
+    #[test]
+    fn reserve_first_slot_succeeds_under_cap() {
+        let mut s = State::fresh(500.0);
+        assert_eq!(s.reserved_slots(), 0);
+        assert!(s.try_reserve_entry("MINT_A", 1));
+        assert_eq!(s.reserved_slots(), 1);
+        assert!(s.pending_entries.contains("MINT_A"));
+    }
+
+    #[test]
+    fn reserve_second_concurrent_event_fails_when_cap_is_one() {
+        // THE BUG: two PumpPortal events both pass an `open_positions.len() < 1`
+        // gate before either writes. With `try_reserve_entry` under a single
+        // lock, the second event MUST fail.
+        let mut s = State::fresh(500.0);
+        assert!(s.try_reserve_entry("MINT_A", 1), "first should win");
+        assert!(!s.try_reserve_entry("MINT_B", 1), "second should be refused at cap=1");
+        assert_eq!(s.reserved_slots(), 1);
+    }
+
+    #[test]
+    fn reserve_same_mint_twice_is_refused() {
+        let mut s = State::fresh(500.0);
+        assert!(s.try_reserve_entry("MINT_A", 5));
+        assert!(!s.try_reserve_entry("MINT_A", 5), "duplicate reservation for same mint refused");
+        assert_eq!(s.reserved_slots(), 1);
+    }
+
+    #[test]
+    fn reserve_refused_when_mint_already_open() {
+        let mut s = State::fresh(500.0);
+        s.open_positions.insert("MINT_A".into(), position(10.0));
+        assert!(!s.try_reserve_entry("MINT_A", 5), "cannot reserve already-open mint");
+    }
+
+    #[test]
+    fn reserved_slots_counts_open_plus_pending() {
+        let mut s = State::fresh(500.0);
+        s.open_positions.insert("OPEN_1".into(), position(10.0));
+        s.open_positions.insert("OPEN_2".into(), position(10.0));
+        assert!(s.try_reserve_entry("PENDING_1", 5));
+        // 2 open + 1 pending = 3
+        assert_eq!(s.reserved_slots(), 3);
+    }
+
+    #[test]
+    fn reserve_refused_when_total_would_exceed_max() {
+        // Cap=2, already 1 open + 1 pending. Third entry must be refused.
+        let mut s = State::fresh(500.0);
+        s.open_positions.insert("OPEN_1".into(), position(10.0));
+        assert!(s.try_reserve_entry("PENDING_1", 2));
+        assert!(!s.try_reserve_entry("PENDING_2", 2), "third entry over cap refused");
+    }
+
+    #[test]
+    fn release_clears_pending_and_frees_slot() {
+        let mut s = State::fresh(500.0);
+        assert!(s.try_reserve_entry("MINT_A", 1));
+        assert_eq!(s.reserved_slots(), 1);
+        assert!(s.release_entry_reservation("MINT_A"));
+        assert_eq!(s.reserved_slots(), 0);
+        // Now a fresh entry can take the slot.
+        assert!(s.try_reserve_entry("MINT_B", 1));
+    }
+
+    #[test]
+    fn release_is_idempotent() {
+        let mut s = State::fresh(500.0);
+        s.try_reserve_entry("MINT_A", 1);
+        assert!(s.release_entry_reservation("MINT_A"));
+        // Second release is a no-op and returns false.
+        assert!(!s.release_entry_reservation("MINT_A"));
+        assert!(!s.release_entry_reservation("NEVER_RESERVED"));
+    }
+
+    #[test]
+    fn release_does_not_remove_from_open_positions() {
+        // Safety: release_entry_reservation must ONLY touch pending_entries.
+        let mut s = State::fresh(500.0);
+        s.open_positions.insert("MINT_A".into(), position(10.0));
+        assert!(!s.release_entry_reservation("MINT_A"));
+        assert!(s.open_positions.contains_key("MINT_A"), "open_positions untouched");
+    }
+
+    #[test]
+    fn pending_entries_is_not_serialized() {
+        // Ensure pending_entries is `#[serde(skip)]` so it never persists
+        // across restarts — if it did, a crashed bot could refuse to enter on
+        // restart because of stale pending mints.
+        let mut s = State::fresh(500.0);
+        s.try_reserve_entry("MINT_A", 5);
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("pending_entries"), "pending_entries must be skipped: {json}");
+        assert!(!json.contains("MINT_A"), "reserved mint must not leak into state.json");
     }
 }

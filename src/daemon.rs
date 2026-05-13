@@ -581,12 +581,21 @@ async fn handle_new_token(
         }
     }
 
+    // 🛡️ RACE FIX (2026-05-13): atomically reserve a concurrency slot.
+    // PREVIOUSLY (BROKEN): two simultaneous tokio::spawn'd handlers both
+    // locked state, both saw `open_positions.len() < max`, both released the
+    // lock, then both inserted — yielding N+1 positions when N was the cap.
+    // NOW: `try_reserve_entry` performs the check + insert under one lock,
+    // so only one handler can win the last available slot per mint.
+    // EVERY early-return below this point must call `release_entry_reservation`
+    // unless the position has been successfully inserted into `open_positions`.
     {
-        let s = state.lock().await;
-        if s.open_positions.len() >= cfg.trading.max_concurrent_positions { return Ok(()); }
-        if s.open_positions.contains_key(&tok.mint) { return Ok(()); }
-        // LIVE: skip if a buy is already in flight for this mint.
+        let mut s = state.lock().await;
+        // LIVE: also skip if a buy is already in flight for this mint.
         if executor.is_some() && s.live_in_flight.contains(&tok.mint) { return Ok(()); }
+        if !s.try_reserve_entry(&tok.mint, cfg.trading.max_concurrent_positions) {
+            return Ok(());
+        }
     }
 
     let sol_usd = jup.sol_usd().await.unwrap_or(90.0);
@@ -594,6 +603,7 @@ async fn handle_new_token(
     if !decision.accept {
         info!(mint=%tok.mint, reason=%decision.reason, "❌ filter reject");
         let _ = db.record_rejection(&tok.mint, &decision.reason);
+        state.lock().await.release_entry_reservation(&tok.mint);
         return Ok(());
     }
 
@@ -602,6 +612,7 @@ async fn handle_new_token(
         let reason = format!("copycat_symbol seen {}s ago", age_ms / 1000);
         info!(mint=%tok.mint, symbol=%display_symbol, age_ms, "🪞 copy-cat reject");
         let _ = db.record_rejection(&tok.mint, &reason);
+        state.lock().await.release_entry_reservation(&tok.mint);
         return Ok(());
     }
 
@@ -609,6 +620,7 @@ async fn handle_new_token(
         (Some(s), Some(t)) if t > 0.0 => (s, t),
         _ => {
             let _ = db.record_rejection(&tok.mint, "no_curve_state");
+            state.lock().await.release_entry_reservation(&tok.mint);
             return Ok(());
         }
     };
@@ -617,6 +629,7 @@ async fn handle_new_token(
     let entry_price = (v_sol / v_tokens) * sol_usd;
     if entry_price <= 0.0 || !entry_price.is_finite() {
         let _ = db.record_rejection(&tok.mint, "bad_entry_price");
+        state.lock().await.release_entry_reservation(&tok.mint);
         return Ok(());
     }
 
@@ -627,17 +640,20 @@ async fn handle_new_token(
         s.bankroll_usd * (cfg.trading.position_size_pct / 100.0)
     };
 
-    // Pre-flight: bankroll guard, in-flight guard, halt-flag guard.
+    // Pre-flight: bankroll guard, halt-flag guard. Concurrency was already
+    // reserved above; do not re-check `open_positions.len()` here (that would
+    // double-count vs. our own pending reservation).
     {
-        let s = state.lock().await;
-        if s.open_positions.len() >= cfg.trading.max_concurrent_positions { return Ok(()); }
+        let mut s = state.lock().await;
         if size_usd <= 0.0 || size_usd > s.bankroll_usd {
             warn!(size_usd, bankroll = s.bankroll_usd, "📉 skipping entry — trading bankroll cannot cover position size");
+            s.release_entry_reservation(&tok.mint);
             return Ok(());
         }
     }
     if executor.is_some() && is_halted() {
         warn!(mint=%tok.mint, "skipping entry — kill switch flag present");
+        state.lock().await.release_entry_reservation(&tok.mint);
         return Ok(());
     }
 
@@ -662,6 +678,7 @@ async fn handle_new_token(
                 let reason = "pre_exit_slippage_uncomputable";
                 warn!(mint=%tok.mint, v_sol, v_tokens, "⚠️ pre-buy slippage estimate returned None — refusing entry");
                 let _ = db.record_rejection(&tok.mint, reason);
+                state.lock().await.release_entry_reservation(&tok.mint);
                 return Ok(());
             }
             Some(estimated_slippage) => {
@@ -679,6 +696,7 @@ async fn handle_new_token(
                         "❌ pre-buy slippage too high — entry refused"
                     );
                     let _ = db.record_rejection(&tok.mint, &reason);
+                    state.lock().await.release_entry_reservation(&tok.mint);
                     return Ok(());
                 }
                 info!(
@@ -736,6 +754,7 @@ async fn handle_new_token(
                     "🛑 LIVE buy refused — position_size_sol exceeds live_max_position_sol cap. Raise the cap deliberately to scale up."
                 );
                 let _ = db.record_rejection(&tok.mint, "live_position_cap_exceeded");
+                state.lock().await.release_entry_reservation(&tok.mint);
                 return Ok(());
             }
 
@@ -775,6 +794,8 @@ async fn handle_new_token(
                     let trip = {
                         let mut s = state.lock().await;
                         s.live_consecutive_failures += 1;
+                        // Release reservation — buy did not produce a position.
+                        s.release_entry_reservation(&tok.mint);
                         s.live_consecutive_failures
                     };
                     let _ = tg.send(&format!(
@@ -791,7 +812,10 @@ async fn handle_new_token(
         // PAPER path
         None => {
             let mut s = state.lock().await;
-            if s.open_positions.len() >= cfg.trading.max_concurrent_positions { return Ok(()); }
+            // Concurrency was already reserved at filter-pass time. Re-checking
+            // `open_positions.len() >= max` here would double-count if other
+            // handlers were racing — but `try_reserve_entry` already excluded
+            // that case. Safe to proceed directly to position open.
             positions::open_position_paper(
                 &mut s, tok.mint.clone(), symbol.clone(),
                 entry_price,
@@ -811,8 +835,13 @@ async fn handle_new_token(
             )
         }
     };
+    // 🛡️ RACE FIX: position is now in `open_positions`. Release the
+    // reservation slot — the open_position itself now occupies the slot,
+    // so leaving the reservation in place would double-count and refuse
+    // any future entries.
     {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
+        s.release_entry_reservation(&tok.mint);
         let _ = s.save(&cfg.storage.state_path);
     }
     info!(mint=%pos.mint, symbol=%pos.symbol, entry=pos.entry_price_usd, size=pos.size_usd, mode=%cfg.trading.mode, "🎯 entered position");
