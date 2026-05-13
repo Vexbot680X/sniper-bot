@@ -164,6 +164,28 @@ pub struct Trading {
     #[serde(default = "default_priority_fee_percentile")]
     pub priority_fee_percentile: u8,
 
+    /// 🚀 LATENCY (2026-05-13): how long to wait for tx confirmation before
+    /// declaring the send a failure. Replaces the old
+    /// `send_and_confirm_transaction_with_spinner` default of ~30s. Lower =
+    /// faster failure recovery; higher = tolerates slow validators. Default 20.
+    #[serde(default = "default_confirm_timeout_secs")]
+    pub confirm_timeout_secs: u32,
+
+    /// 🚀 LATENCY (2026-05-13): how often to poll `get_signature_statuses`
+    /// during the confirmation wait. Lower = more responsive but more RPC
+    /// calls; higher = less RPC pressure but slower wake-on-confirm. Default
+    /// 400ms, ~2.5 polls/sec.
+    #[serde(default = "default_confirm_poll_interval_ms")]
+    pub confirm_poll_interval_ms: u64,
+
+    /// 🛡️ STALE-CURVE GUARD (2026-05-13): max age (millis) of a NewToken
+    /// event between WS receive time and the buy decision. If the handler
+    /// queue lagged longer than this, the curve depth in v_sol/v_tokens is
+    /// no longer trustworthy and we refuse entry rather than trade against
+    /// stale slippage math. Default 1500ms. Set to 0 to disable the guard.
+    #[serde(default = "default_max_curve_age_ms")]
+    pub max_curve_age_ms: u32,
+
     /// SAFETY (Phase 3): LIVE-mode startup reconciliation guard.
     /// When true (default), the bot computes total book value
     /// (state.bankroll_usd + state.vault_usd + sum(open_positions.size_usd))
@@ -283,6 +305,9 @@ pub struct Trading {
 
 fn default_slippage_bps() -> u16 { 200 }
 fn default_priority_fee_percentile() -> u8 { 75 }
+fn default_confirm_timeout_secs() -> u32 { 20 }
+fn default_confirm_poll_interval_ms() -> u64 { 400 }
+fn default_max_curve_age_ms() -> u32 { 1500 }
 fn default_live_max_position_sol() -> f64 { 0.01 }
 fn default_reconciliation_required() -> bool { true }
 fn default_reconciliation_tolerance() -> f64 { 0.05 }

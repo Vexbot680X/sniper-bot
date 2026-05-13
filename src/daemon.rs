@@ -624,6 +624,27 @@ async fn handle_new_token(
             return Ok(());
         }
     };
+
+    // 🛡️ STALE-CURVE GUARD (2026-05-13): if this NewToken frame has been
+    // sitting in our handler queue for too long, the curve depth advertised
+    // in v_sol/v_tokens is no longer trustworthy — it could have moved
+    // enough to invalidate our pre-buy slippage math, leading to a worse
+    // entry / exit than we'd accept. Bail before pulling the trigger.
+    // Threshold is configurable; default 1500ms. Set to 0 to disable.
+    if cfg.trading.max_curve_age_ms > 0 {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let received = if tok.received_at_ms > 0 { tok.received_at_ms } else { now_ms };
+        let age_ms = now_ms - received;
+        if age_ms > cfg.trading.max_curve_age_ms as i64 {
+            let reason = format!("stale_curve {}ms > {}ms", age_ms, cfg.trading.max_curve_age_ms);
+            info!(mint=%tok.mint, symbol=%tok.symbol, age_ms, threshold_ms=cfg.trading.max_curve_age_ms,
+                  "⏱️ stale curve — handler queue lag exceeded threshold, refusing entry");
+            let _ = db.record_rejection(&tok.mint, &reason);
+            state.lock().await.release_entry_reservation(&tok.mint);
+            return Ok(());
+        }
+    }
+
     curves.upsert(&tok.mint, v_sol, v_tokens).await;
     curve_sub.subscribe(vec![tok.mint.clone()]).await;
     let entry_price = (v_sol / v_tokens) * sol_usd;

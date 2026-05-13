@@ -20,6 +20,15 @@ pub struct NewToken {
     /// pump.fun's optional 24h AI-driven market-maker mode — doubles supply to 2B,
     /// AI agent randomly buys/sells the other 1B. High volatility / unpredictable.
     #[serde(default, alias = "is_mayhem_mode")] pub is_mayhem_mode: Option<bool>,
+    /// 🛡️ STALE-CURVE GUARD (2026-05-13): UTC millis when we received this
+    /// frame off the WebSocket. NOT from the WS payload — stamped locally
+    /// in `run_once` immediately after deserialization. Used by the daemon
+    /// to refuse entry on tokens that sat in our handler queue for too long
+    /// (curve depth could have moved enough to invalidate filter / slippage
+    /// math). Set to 0 by serde default if some other code constructs a
+    /// NewToken — the daemon falls back to "current time" in that case.
+    #[serde(default)]
+    pub received_at_ms: i64,
 }
 
 pub fn spawn_listener(ws_url: String) -> mpsc::Receiver<NewToken> {
@@ -47,7 +56,9 @@ async fn run_once(ws_url: &str, tx: mpsc::Sender<NewToken>) -> Result<()> {
         let msg = msg?;
         if let Message::Text(txt) = msg {
             match serde_json::from_str::<NewToken>(&txt) {
-                Ok(tok) if !tok.mint.is_empty() => {
+                Ok(mut tok) if !tok.mint.is_empty() => {
+                    // 🛡️ Stamp receive-time. Drives the daemon's stale-curve guard.
+                    tok.received_at_ms = chrono::Utc::now().timestamp_millis();
                     let _ = tx.send(tok).await;
                 }
                 Ok(_) => {} // ack/empty

@@ -18,7 +18,8 @@ use pumpfun::{
     PumpFun,
 };
 use rand::SeedableRng;
-use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_rpc_client_api::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
+use solana_sdk::commitment_config::CommitmentLevel;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -107,6 +108,14 @@ pub struct Executor {
     /// to Jito (as a [tip_tx, trade_tx] bundle) AND Helius in parallel; whichever
     /// confirms first wins via Solana's signature dedup.
     pub jito: Option<JitoClient>,
+    /// 🚀 LATENCY (2026-05-13): how long to wait for confirmation before
+    /// declaring a send failure. Default 20s. Loaded from
+    /// `cfg.trading.confirm_timeout_secs`.
+    pub confirm_timeout_secs: u32,
+    /// 🚀 LATENCY (2026-05-13): how often to poll `get_signature_statuses`
+    /// during the confirmation wait. Default 400ms. Loaded from
+    /// `cfg.trading.confirm_poll_interval_ms`.
+    pub confirm_poll_interval_ms: u64,
 }
 
 impl Executor {
@@ -180,6 +189,8 @@ impl Executor {
             slippage_bps: (cfg.trading.slippage_bps as u64).max(1),
             priority_fee_percentile: cfg.trading.priority_fee_percentile,
             jito,
+            confirm_timeout_secs: cfg.trading.confirm_timeout_secs,
+            confirm_poll_interval_ms: cfg.trading.confirm_poll_interval_ms,
         })
     }
 
@@ -420,8 +431,26 @@ impl Executor {
     /// signature, so only one inclusion can land; whichever block engine wins,
     /// the other becomes a no-op. If Helius wins, the Jito bundle is dropped
     /// and we pay no tip. Logs winner via `tracing::info` for measurement.
+    ///
+    /// LATENCY (2026-05-13 redesign): the old path was
+    /// `send_and_confirm_transaction_with_spinner_and_commitment` which
+    /// internally:
+    ///   1. Runs preflight simulate AGAIN (we already did one above).
+    ///   2. Submits with RPC-side retries (max_retries default = None = many).
+    ///   3. Polls every 500ms with a TUI spinner.
+    /// That adds 0.5–2s per send vs. the minimum-viable path. We replace it
+    /// with:
+    ///   1. `send_transaction_with_config(skip_preflight=true, max_retries=0)`
+    ///      — ships the wire bytes to the RPC and returns the signature
+    ///      ASAP. We don't ask the RPC to retry; we already have Jito as a
+    ///      parallel path, and a stale-blockhash retry from the RPC is more
+    ///      latency than re-firing the tx ourselves.
+    ///   2. Hand-rolled confirmation loop polling `get_signature_statuses`
+    ///      every 400ms up to `confirm_timeout_secs` (default 20s), checking
+    ///      for confirmation_status >= Confirmed and surfacing on-chain errors
+    ///      immediately.
     async fn send_versioned_tx(&self, tx: &solana_sdk::transaction::VersionedTransaction) -> Result<Signature> {
-        // Pre-flight simulate.
+        // Pre-flight simulate — catches bad txs before paying any fee.
         let sim_cfg = RpcSimulateTransactionConfig {
             sig_verify: false,
             replace_recent_blockhash: true,
@@ -478,40 +507,106 @@ impl Executor {
             }
         }
 
-        let send_res = self.rpc.client
-            .send_and_confirm_transaction_with_spinner_and_commitment(
-                tx,
-                CommitmentConfig::confirmed(),
-            ).await;
-        match send_res {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                let err_str = format!("{e}");
-                let sig_attempted = tx.signatures.first().copied();
-                let mut logs_block = String::new();
-                if let Some(sig_a) = sig_attempted {
-                    if let Ok(tx_status) = self.rpc.client.get_transaction(
-                        &sig_a,
-                        UiTransactionEncoding::Json,
-                    ).await {
-                        if let Some(meta) = tx_status.transaction.meta {
-                            let logs: Vec<String> = match meta.log_messages {
-                                solana_transaction_status::option_serializer::OptionSerializer::Some(v) => v,
-                                _ => Vec::new(),
-                            };
-                            if !logs.is_empty() {
-                                logs_block = format!("\nsig={sig_a}\non-chain logs:\n{}", logs.join("\n"));
-                            } else {
-                                logs_block = format!("\nsig={sig_a} (no logs)");
-                            }
+        // 🚀 LATENCY-OPTIMIZED SEND: fire-and-confirm.
+        // skip_preflight=true — we already simulated above; no point doing it
+        //                      twice (saves 1 RPC roundtrip = 100–500ms).
+        // max_retries=0      — don't let the RPC silently retry. We'd rather
+        //                      know immediately if the send drops so we can
+        //                      rebuild with a fresh blockhash, AND Jito is
+        //                      already our parallel path.
+        let send_cfg = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: Some(CommitmentLevel::Processed),
+            encoding: None,
+            max_retries: Some(0),
+            min_context_slot: None,
+        };
+        let sig = self.rpc.client
+            .send_transaction_with_config(tx, send_cfg)
+            .await
+            .map_err(|e| anyhow!("send_transaction_with_config: {e}"))?;
+        let send_t_ms = chrono::Utc::now().timestamp_millis();
+
+        // Custom confirmation loop. Polls `get_signature_statuses` every
+        // ~400ms until we see `confirmation_status >= Confirmed` (or `err`).
+        // Bounded by `confirm_timeout_secs` (default 20s). On timeout, we
+        // surface the signature so the caller / journal can keep watch — it
+        // might still land after; but for our hold-time math it's a fail.
+        let timeout = Duration::from_secs(self.confirm_timeout_secs as u64);
+        let poll_interval = Duration::from_millis(self.confirm_poll_interval_ms);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last_err_logged = false;
+        loop {
+            match self.rpc.client.get_signature_statuses(&[sig]).await {
+                Ok(resp) => {
+                    if let Some(Some(status)) = resp.value.into_iter().next() {
+                        // On-chain error: surface immediately with logs.
+                        if let Some(tx_err) = status.err {
+                            return Err(self.tx_error_with_logs(&sig, format!("on-chain tx error: {tx_err:?}")).await);
                         }
-                    } else {
-                        logs_block = format!("\nsig={sig_a} (no tx record)");
+                        // Treat any confirmation level (processed/confirmed/finalized)
+                        // as good enough — our commitment policy is `confirmed`.
+                        use solana_transaction_status::TransactionConfirmationStatus as TCS;
+                        if let Some(cs) = status.confirmation_status {
+                            if matches!(cs, TCS::Confirmed | TCS::Finalized) {
+                                let elapsed_ms = chrono::Utc::now().timestamp_millis() - send_t_ms;
+                                tracing::debug!(sig=%sig, elapsed_ms, "✅ tx confirmed");
+                                return Ok(sig);
+                            }
+                        } else if status.confirmations.is_none() {
+                            // confirmations=None means rooted/finalized in older APIs.
+                            let elapsed_ms = chrono::Utc::now().timestamp_millis() - send_t_ms;
+                            tracing::debug!(sig=%sig, elapsed_ms, "✅ tx rooted");
+                            return Ok(sig);
+                        }
+                    }
+                    // status is None — RPC hasn't seen it yet. Keep polling.
+                    last_err_logged = false;
+                }
+                Err(e) => {
+                    // Don't fail on transient RPC errors during confirmation —
+                    // just log once and keep polling. Timeout will trip if it
+                    // persists.
+                    if !last_err_logged {
+                        tracing::warn!(sig=%sig, error=%e, "get_signature_statuses transient error, continuing to poll");
+                        last_err_logged = true;
                     }
                 }
-                Err(anyhow!("submit versioned tx: {err_str}{logs_block}"))
             }
+            if std::time::Instant::now() >= deadline {
+                return Err(self.tx_error_with_logs(
+                    &sig,
+                    format!("confirmation timeout after {}s", self.confirm_timeout_secs),
+                ).await);
+            }
+            tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    /// Fetch on-chain logs for `sig` if available, and wrap them into an error
+    /// message alongside `prefix`. Used by the send path to give us actionable
+    /// post-hoc context when a tx fails confirmation.
+    async fn tx_error_with_logs(&self, sig: &Signature, prefix: String) -> anyhow::Error {
+        let mut logs_block = String::new();
+        if let Ok(tx_status) = self.rpc.client.get_transaction(
+            sig,
+            UiTransactionEncoding::Json,
+        ).await {
+            if let Some(meta) = tx_status.transaction.meta {
+                let logs: Vec<String> = match meta.log_messages {
+                    solana_transaction_status::option_serializer::OptionSerializer::Some(v) => v,
+                    _ => Vec::new(),
+                };
+                if !logs.is_empty() {
+                    logs_block = format!("\non-chain logs:\n{}", logs.join("\n"));
+                } else {
+                    logs_block = String::from(" (no logs)");
+                }
+            }
+        } else {
+            logs_block = String::from(" (no tx record)");
+        }
+        anyhow!("{prefix} sig={sig}{logs_block}")
     }
 
     /// Buy `amount_sol` SOL worth of `mint`. Returns the actual fill.

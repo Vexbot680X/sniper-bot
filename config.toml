@@ -8,6 +8,19 @@ starting_bankroll_usd = 500.0
 # LIVE-mode tx params (ignored in paper mode):
 slippage_bps = 1500             # 15% slippage — raised from 500 on 2026-05-10 17:51 UTC. Strategy v3: ACCEPT worse fills so we can ESCAPE positions before crowd dumps curve. Sell-side slippage was eating 50-80% of curve gains; tolerating worse fills is better than getting trapped in -35% TP exits.
 priority_fee_percentile = 75    # 75th percentile of recent priority fees
+
+# 🚀 LATENCY (2026-05-13): tx send/confirm tuning. Replaces the old
+# `send_and_confirm_transaction_with_spinner` path (~30s default timeout,
+# 500ms polls, RPC-side retries). New path: skip_preflight=true + max_retries=0,
+# custom poll loop on get_signature_statuses every confirm_poll_interval_ms.
+confirm_timeout_secs = 20         # declare send failed after this many seconds without confirmation
+confirm_poll_interval_ms = 400    # how often to ask the RPC if our tx confirmed
+
+# 🛡️ STALE-CURVE GUARD (2026-05-13): max ms between WS receive time and
+# the buy decision. If our handler queue lagged longer than this, the
+# curve depth in the NewToken event is no longer trustworthy and we refuse
+# the entry. Set to 0 to disable.
+max_curve_age_ms = 1500
 # Fixed position size in SOL. Always sized at this many SOL converted to USD
 # at decision time using current sol_usd. When > 0, overrides position_size_pct.
 # 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
