@@ -18,7 +18,6 @@ mod wallet;
 mod rpc;
 mod executor;
 mod jito;
-mod tip_inject;
 mod pump_ix;
 mod pumpportal_trade;
 
