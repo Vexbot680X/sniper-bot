@@ -6,6 +6,7 @@ pub mod config;
 pub mod dev_watcher;
 pub mod executor;
 pub mod jito;
+pub mod tip_inject;
 pub mod paper_slippage;
 pub mod pump_ix;
 pub mod pumpportal_trade;

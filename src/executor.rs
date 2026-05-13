@@ -452,6 +452,49 @@ impl Executor {
     ///      for confirmation_status >= Confirmed and surfacing on-chain errors
     ///      immediately.
     async fn send_versioned_tx(&self, tx: &solana_sdk::transaction::VersionedTransaction) -> Result<Signature> {
+        // ⚡ If Jito is enabled, inject the tip transfer as the LAST instruction
+        // of the trade tx (per Jito's official guidance, Rust SDK example, and
+        // skill docs). This is the structural fix for the intermittent
+        // "Bundles must write lock at least one tip account" rejection we saw
+        // with the old [tip_tx, trade_tx] 2-tx bundle pattern (2026-05-13).
+        //
+        // Important: the tipped tx has a DIFFERENT signature than the original.
+        // We use the tipped tx for BOTH Helius and Jito paths so Solana's
+        // sig-dedup still gives us at-most-once landing.
+        //
+        // If Jito is disabled or tip injection fails, fall back to the
+        // original tx (Helius-only).
+        let tx_for_send: std::borrow::Cow<solana_sdk::transaction::VersionedTransaction> =
+            if let Some(jito) = &self.jito {
+                match crate::tip_inject::random_tip_account() {
+                    Ok(tip_account) => {
+                        let tip_lamports = jito.effective_tip_lamports();
+                        match crate::tip_inject::inject_tip(
+                            tx.clone(),
+                            &self.trading_kp,
+                            tip_account,
+                            tip_lamports,
+                        ) {
+                            Ok(tipped) => std::borrow::Cow::Owned(tipped),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "tip injection failed; falling back to untipped tx (helius only)"
+                                );
+                                std::borrow::Cow::Borrowed(tx)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error=%e, "random_tip_account failed; helius only");
+                        std::borrow::Cow::Borrowed(tx)
+                    }
+                }
+            } else {
+                std::borrow::Cow::Borrowed(tx)
+            };
+        let tx: &solana_sdk::transaction::VersionedTransaction = &tx_for_send;
+
         // Pre-flight simulate — catches bad txs before paying any fee.
         let sim_cfg = RpcSimulateTransactionConfig {
             sig_verify: false,
@@ -471,42 +514,30 @@ impl Executor {
             return Err(anyhow!("pre-send simulate failed: {err:?}\n{logs}"));
         }
 
-        // ⚡ Optional Jito parallel-submit. Build a [tip_tx, trade_tx] bundle
-        // and fire it concurrently with the Helius send. Tip tx and trade tx
-        // share the same blockhash window so Jito can include them in one block.
-        // Failures are non-fatal: we always run the Helius path.
+        // ⚡ Jito parallel-submit, now using the TIPPED tx in a 1-tx bundle.
+        // The tip transfer is the last instruction of the trade tx itself, so
+        // Jito's auction logic sees the tip-account write-lock IN THE SAME
+        // transaction that does the trade — satisfying the "must write lock at
+        // least one tip account" requirement that the old 2-tx bundle pattern
+        // failed to reliably satisfy.
+        //
+        // Failures are non-fatal: Helius path runs below regardless.
         if let Some(jito) = &self.jito {
-            // Fetch latest blockhash for the tip tx. Cheap call.
-            let blockhash_res = self.rpc.client
-                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-                .await;
-            match blockhash_res {
-                Ok((bh, _)) => {
-                    match jito.build_tip_tx(&self.trading_kp, bh) {
-                        Ok(tip_tx) => {
-                            let bundle = vec![tip_tx, tx.clone()];
-                            let jito_client = jito.clone();
-                            let trade_sig = tx.signatures.first().copied();
-                            // Fire and forget — Helius path runs below and is the
-                            // authoritative confirmation. Bundle id is logged for
-                            // post-hoc analysis (which path won which trade).
-                            tokio::spawn(async move {
-                                let res = jito_client.send_bundle_best_effort(&bundle).await;
-                                if let Some(bid) = res {
-                                    tracing::info!(
-                                        bundle_id=%bid,
-                                        trade_sig=?trade_sig,
-                                        tip_lamports=jito_client.tip_lamports(),
-                                        "⚡ jito bundle submitted (parallel to helius)"
-                                    );
-                                }
-                            });
-                        }
-                        Err(e) => tracing::warn!(error=%e, "jito build_tip_tx failed; helius-only this trade"),
-                    }
+            let bundle = vec![tx.clone()];
+            let jito_client = jito.clone();
+            let trade_sig = tx.signatures.first().copied();
+            // Fire and forget — Helius is the authoritative confirmation path.
+            tokio::spawn(async move {
+                let res = jito_client.send_bundle_best_effort(&bundle).await;
+                if let Some(bid) = res {
+                    tracing::info!(
+                        bundle_id=%bid,
+                        trade_sig=?trade_sig,
+                        tip_lamports=jito_client.tip_lamports(),
+                        "⚡ jito bundle submitted (parallel to helius, tip-in-tx)"
+                    );
                 }
-                Err(e) => tracing::warn!(error=%e, "jito get_latest_blockhash failed; helius-only this trade"),
-            }
+            });
         }
 
         // 🚀 LATENCY-OPTIMIZED SEND: fire-and-confirm.
