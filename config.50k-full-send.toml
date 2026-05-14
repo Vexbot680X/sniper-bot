@@ -54,7 +54,7 @@ position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_s
 # what position_size_sol or any other math says. Paper mode ignores this.
 # Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
 live_max_position_sol = 0.05    # 🚨 AGGRESSIVE 2026-05-14 14:27 — hard cap matches position_size_sol. New confirm-phrase required.
-take_profit_pct = 30.0           # 🆕 50-70K 2026-05-14 15:35 — wider TP. Pre-grad pumps to $69k play out over minutes; +30% on 0.05 SOL ($4.57) = ~$1.37 gross win.
+take_profit_pct = 25.0           # 🔥 50-70K 2026-05-14 16:55 (unified) — lowered from +30 to +25 per Mamba unified spec. On 0.05 SOL → ~$1.14 gross / ~$1.04 net.
 stop_loss_pct = 10.0             # 🆕 50-70K 2026-05-14 — -10% stop. Tight enough to cap rug damage, loose enough not to whipsaw on normal pre-grad volatility.
 max_concurrent_positions = 3    # 🔥 FULL-SEND 2026-05-14 15:55 — RAISED from 1 to 3. Mamba asked for 10; capped at 3 because wallet ($33.78) can only fund 6 concurrent 0.05 SOL positions ($27.42) before insufficient-balance errors start. 3 leaves room for fees and slippage on each.
 max_hold_seconds = 180          # 🆕 50-70K 2026-05-14 — 3-min hold. Pre-grad pumps need minutes; 20s was for $3-5k mcap micro-scalps.
@@ -133,8 +133,8 @@ heartbeat_interval_seconds = 300
 #   460 SOL  (~$69k)   — graduation candidates only
 # Mcap floor: USD-denominated takes precedence when set; bot converts to SOL
 # at decision time using current sol_usd — always self-consistent.
-min_market_cap_usd = 50000.0     # 🆕 50-70K 2026-05-14 15:35 — NEW STRATEGY: bonding-curve mid-band. Tokens that reached $50k have survived initial bundler dump phase; curve depth here is ~10x deeper than $3-5k. Rule #3: 0.05 SOL = ~1% of curve depth ✅.
-max_market_cap_usd = 70000.0     # 🆕 50-70K 2026-05-14 — just below pump.fun graduation threshold (~$69k). Catch the final push to grad + initial post-grad pump if hold-time covers migration.
+min_market_cap_usd = 35000.0     # 🄓 LOOSENED 2026-05-14 17:16 — dropped $50k→$35k for more candidates. Same band shape, just lower floor.
+max_market_cap_usd = 70000.0     # 🆕 50-70K — ceiling unchanged.
 min_market_cap_sol = 0.0        # legacy SOL floor, disabled when min_market_cap_usd > 0
 require_mint_renounced = true
 require_no_freeze_authority = true

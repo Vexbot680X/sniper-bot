@@ -94,7 +94,7 @@ scale_out_delay_ms = 500
 #     (overwhelmingly likely serial rugger).
 # Cheapest filter we run — one indexed-table query per token.
 dev_vetting_required = true            # 🔵 MIDBAND — KEEP ON. Mid-band is where bundlers pump-and-dump; serial-rugger filter is essential. Killer feature also stays ON below.
-dev_vetting_max_launches_24h = 3
+dev_vetting_max_launches_24h = 10      # 🔓 LOOSENED 2026-05-14 17:16 — was 3. Block only spam-rug devs (10+ launches/24h).
 
 # 🛡️ FEATURE (Phase 3.Feature.5): dev wallet WS rug-watcher.
 # Every open live position subscribes its dev_pubkey to a Helius logsSubscribe
@@ -210,10 +210,11 @@ max_candidates = 2000
 # fresh-launch chaos is filtered out by min_age_secs.
 [momentum]
 enabled = true
-min_age_secs = 300                # skip mints younger than 5 min
-spike_multiplier = 5.0            # 1m vol/s must be 5x baseline 5m vol/s
-min_short_volume_sol = 1.0        # at least 1 SOL (~$92) traded in last 60s
-min_mcap_sol_to_fire = 100.0      # mcap >= 100 SOL (~$9k) at fire time
-min_mcap_rise_pct = 10.0          # mcap rose >= 10% over the short window
-sweep_interval_ms = 1000          # check every 1s
-max_mints = 5000                  # cap simultaneously-tracked mints
+# 🔓 ALL FIVE THRESHOLDS LOOSENED 2026-05-14 17:16. Was getting 0 entries.
+min_age_secs = 120                # was 300. Catch pop-offs at 2-min mark.
+spike_multiplier = 3.0            # was 5.0. 3x baseline counts as a spike.
+min_short_volume_sol = 0.3        # was 1.0. ~$28 in 60s instead of $92.
+min_mcap_sol_to_fire = 100.0      # unchanged: SOL floor sanity.
+min_mcap_rise_pct = 5.0           # was 10.0. Smaller mcap moves count.
+sweep_interval_ms = 1000
+max_mints = 5000

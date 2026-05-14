@@ -46,16 +46,16 @@ max_curve_age_ms = 1500
 # 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
 # to 0.005 per PHASE_3_PLAN.md — smaller positions = smaller fee drag relative
 # to rug-detection edge, AND smaller blast radius for any safety feature bug.
-position_size_sol = 0.025       # 🔵 MIDBAND 2026-05-14 16:50 — $2.28/trade. Half of 50k-band size. At $15-25k mcap curve depth is ~$150-250 so 0.025 SOL = 1-2% of depth, well within Rule #3.
+position_size_sol = 0.05        # 🔵 MIDBAND 2026-05-14 16:55 (unified) — raised to 0.05 SOL ($4.57) per Mamba. At $15-25k mcap, curve depth ~$150-250 so 0.05 SOL = 2-3% of depth. Still within Rule #3 (<5%) but tighter than at 50k-band.
 position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
 
 # 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
 # The bot refuses any LIVE buy that would exceed this many SOL, regardless of
 # what position_size_sol or any other math says. Paper mode ignores this.
 # Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
-live_max_position_sol = 0.025   # 🔵 MIDBAND — hard cap matches position_size_sol. New confirm-phrase required.
-take_profit_pct = 20.0           # 🔵 MIDBAND — +20% target. On 0.025 SOL ($2.28) → ~$0.46 gross. Smaller % than 50k band because $15-25k tokens have shorter momentum legs.
-stop_loss_pct = 8.0              # 🔵 MIDBAND — -8% stop. Mid-band volatility is lower than fresh-launch chaos but higher than pre-grad.
+live_max_position_sol = 0.05    # 🔵 MIDBAND (unified) — hard cap matches position_size_sol.
+take_profit_pct = 25.0           # 🔵 MIDBAND 16:55 (unified) — +25% target. On 0.05 SOL ($4.57) → ~$1.14 gross / ~$1.04 net win.
+stop_loss_pct = 10.0             # 🔵 MIDBAND 16:55 (unified) — -10% stop. On 0.05 SOL → ~$0.46 max book loss + $0.09 fees = ~$0.55 per stopped trade.
 max_concurrent_positions = 2    # 🔵 MIDBAND — cap at 2 concurrent. Combined with 50k bot's max 3, total wallet exposure caps at 3*0.05 + 2*0.025 = 0.2 SOL = ~$18 (54% wallet). Hard ceiling so the two bots can't blow up together.
 max_hold_seconds = 90           # 🔵 MIDBAND — 90s hold. Mid-band momentum dies faster than pre-grad; longer than fresh-launch micro-scalps.
 # Rug exit: if open position's mcap collapses below this, force-close.
@@ -94,7 +94,7 @@ scale_out_delay_ms = 500
 #     (overwhelmingly likely serial rugger).
 # Cheapest filter we run — one indexed-table query per token.
 dev_vetting_required = true            # 🔵 MIDBAND — KEEP ON. Mid-band is where bundlers pump-and-dump; serial-rugger filter is essential. Killer feature also stays ON below.
-dev_vetting_max_launches_24h = 3
+dev_vetting_max_launches_24h = 10      # 🔓 LOOSENED 2026-05-14 17:16 — was 3. Only block spam-rug devs (10+ launches/24h), let through legitimate devs with a few launches.
 
 # 🛡️ FEATURE (Phase 3.Feature.5): dev wallet WS rug-watcher.
 # Every open live position subscribes its dev_pubkey to a Helius logsSubscribe
@@ -133,8 +133,8 @@ heartbeat_interval_seconds = 300
 #   460 SOL  (~$69k)   — graduation candidates only
 # Mcap floor: USD-denominated takes precedence when set; bot converts to SOL
 # at decision time using current sol_usd — always self-consistent.
-min_market_cap_usd = 15000.0     # 🔵 MIDBAND 2026-05-14 16:50 — lower mid-band. Tokens that survived initial bundler dumps but aren't yet at pre-grad. Far more candidates per hour than 50k band.
-max_market_cap_usd = 25000.0     # 🔵 MIDBAND — ceiling at $25k. Above this overlaps with 50k bot's enrollment territory; cleanly partitioned bands.
+min_market_cap_usd = 10000.0     # 🔓 LOOSENED 2026-05-14 17:16 — widened $15k→$10k floor.
+max_market_cap_usd = 30000.0     # 🔓 LOOSENED 2026-05-14 17:16 — widened $25k→$30k ceiling. 3x more candidates.
 min_market_cap_sol = 0.0        # legacy SOL floor, disabled when min_market_cap_usd > 0
 require_mint_renounced = true
 require_no_freeze_authority = true
