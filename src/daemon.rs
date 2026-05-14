@@ -1132,7 +1132,10 @@ async fn force_exit_all(
         match result {
             Ok(cr) => {
                 ok += 1;
-                info!(mint=%mint, pnl=cr.trade.pnl_pct, "✅ force-exit-all close");
+                let fees_usd = (cr.trade.fees_lamports as f64 / 1e9) * sol_usd;
+                let net_usd = cr.trade.pnl_usd - fees_usd;
+                let net_pct = if cr.trade.size_usd > 0.0 { (net_usd / cr.trade.size_usd) * 100.0 } else { 0.0 };
+                info!(mint=%mint, gross_pct=cr.trade.pnl_pct, gross_usd=cr.trade.pnl_usd, fees_usd=fees_usd, net_usd=net_usd, net_pct=net_pct, "✅ force-exit-all close");
                 let sig_line = cr.sell_signature.as_ref()
                     .map(|s| format!("\n[sell tx](https://solscan.io/tx/{})", s))
                     .unwrap_or_default();
@@ -1335,11 +1338,29 @@ async fn check_positions(
         } else {
             format!("{emoji} *EXIT* `{}` — *{}*", cr.trade.symbol, dec.reason.to_uppercase())
         };
-        info!(mint=%cr.trade.mint, pnl=cr.trade.pnl_pct, reason=%dec.reason, skim=cr.skimmed_usd, "exit");
+        // HEALTH-AUDIT (2026-05-14): true-net logging. gross = quoted exit value vs entry size.
+        // net = gross minus tx fees (entry+exit, captured per Bug #2 fix). Jito tip is paid out
+        // of band; not yet included. Books-vs-chain reconciliation lives here.
+        let fees_usd = (cr.trade.fees_lamports as f64 / 1e9) * sol_usd;
+        let net_usd = cr.trade.pnl_usd - fees_usd;
+        let net_pct = if cr.trade.size_usd > 0.0 { (net_usd / cr.trade.size_usd) * 100.0 } else { 0.0 };
+        info!(
+            mint=%cr.trade.mint,
+            gross_pct=cr.trade.pnl_pct,
+            gross_usd=cr.trade.pnl_usd,
+            fees_usd=fees_usd,
+            net_usd=net_usd,
+            net_pct=net_pct,
+            reason=%dec.reason,
+            skim=cr.skimmed_usd,
+            "💰 exit"
+        );
         tg.send(&format!(
-            "{}\nP/L: `${:.2}` (`{:+.2}%`)\nHold: `{}s`\nBankroll: `${:.2}`{}{}",
+            "{}\nGross: `${:.2}` (`{:+.2}%`)\nFees: `${:.3}`\n*Net: `${:.2}` (`{:+.2}%`)*\nHold: `{}s`\nBankroll: `${:.2}`{}{}",
             header,
             cr.trade.pnl_usd, cr.trade.pnl_pct,
+            fees_usd,
+            net_usd, net_pct,
             cr.trade.hold_seconds,
             bankroll, sell_line, skim_line,
         )).await.ok();

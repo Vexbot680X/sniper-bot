@@ -3,6 +3,8 @@
 /data
 /logs
 /debug
+sniper.log
+sniper.log.*
 
 # Local-only backups of config/state/code. Never committed.
 /backups
