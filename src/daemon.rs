@@ -1,4 +1,5 @@
 use crate::bonding_curve::{CurveSubscriber, CurveTracker};
+use crate::mcap_watcher::{McapWatcher, WatcherCfg, JupiterSolUsd, BandCrossing};
 use solana_sdk::signer::Signer;
 use crate::config::Config;
 use crate::executor::Executor;
@@ -307,6 +308,34 @@ Wallet `{}`  cap `{} SOL`",
     let curves = CurveTracker::new();
     let curve_sub = curves.clone().spawn(cfg.rpc.pumpportal_ws.clone());
 
+    // 2026-05-14: Mcap-progression watcher. When enabled, fresh launches at
+    // seed price that would normally be rejected (low_mcap) get enrolled
+    // here instead. A background sweep polls `CurveTracker` every 500ms;
+    // when a watched candidate crosses INTO [min_market_cap_usd,
+    // max_market_cap_usd], we receive a `BandCrossing` event and route it
+    // back through `handle_new_token` (with synthesized v_sol/v_tokens).
+    // Master switch: `[mcap_watcher] enabled = true` in config.
+    let (mcap_watcher, mut band_crossing_rx): (Option<McapWatcher>, Option<tokio::sync::mpsc::Receiver<BandCrossing>>) = if cfg.mcap_watcher.enabled {
+        let wcfg = WatcherCfg {
+            min_mcap_usd: cfg.filters.min_market_cap_usd,
+            max_mcap_usd: if cfg.filters.max_market_cap_usd > 0.0 { cfg.filters.max_market_cap_usd } else { f64::INFINITY },
+            ttl_secs: cfg.mcap_watcher.ttl_secs,
+            max_candidates: cfg.mcap_watcher.max_candidates,
+        };
+        let provider = std::sync::Arc::new(JupiterSolUsd(jup.clone()));
+        let (w, rx) = McapWatcher::spawn(wcfg, curves.clone(), curve_sub.clone(), provider);
+        info!(
+            min_mcap=cfg.filters.min_market_cap_usd,
+            max_mcap=cfg.filters.max_market_cap_usd,
+            ttl_secs=cfg.mcap_watcher.ttl_secs,
+            max_candidates=cfg.mcap_watcher.max_candidates,
+            "📈 mcap_watcher ENABLED"
+        );
+        (Some(w), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let symbol_cache: SymbolCache = Arc::new(Mutex::new(HashMap::new()));
 
     // Phase 3 Feature.5: shared set of mints that the rug-watcher has flagged
@@ -577,6 +606,55 @@ Wallet `{}`  cap `{} SOL`",
         });
     }
 
+    // Spawn a background task to receive `BandCrossing` events from the
+    // mcap watcher (if enabled) and route them through `handle_new_token`
+    // as synthesized fresh-token events. Same filter chain runs (dev vet,
+    // slippage, killer-feature attach) — only the entry trigger differs.
+    if let Some(mut rx) = band_crossing_rx.take() {
+        let cfg_b = cfg.clone(); let db_b = db.clone(); let state_b = state.clone();
+        let tg_b = tg.clone(); let jup_b = jup.clone(); let curves_b = curves.clone();
+        let curve_sub_b = curve_sub.clone();
+        let symbol_cache_b = symbol_cache.clone();
+        let executor_b = executor.clone();
+        let dev_watcher_b = dev_watcher.clone();
+        let mcap_watcher_b = mcap_watcher.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                info!(mint=%ev.mint, symbol=%ev.symbol, mcap_usd=ev.mcap_usd, "📨 mcap band crossing — routing to entry path");
+                let tok = pumpportal::NewToken {
+                    mint: ev.mint.clone(),
+                    name: ev.name.clone(),
+                    symbol: ev.symbol.clone(),
+                    mcap_sol: None,
+                    v_sol: Some(ev.v_sol),
+                    v_tokens: Some(ev.v_tokens),
+                    initial_buy: None,
+                    trader: ev.trader.clone(),
+                    is_mayhem_mode: ev.is_mayhem_mode,
+                    received_at_ms: ev.detected_at_ms,
+                };
+                let cfg = cfg_b.clone(); let db = db_b.clone(); let state = state_b.clone();
+                let tg = tg_b.clone(); let jup = jup_b.clone(); let curves = curves_b.clone();
+                let curve_sub = curve_sub_b.clone();
+                let symbol_cache = symbol_cache_b.clone();
+                let executor = executor_b.clone();
+                let dev_watcher_clone = dev_watcher_b.clone();
+                let mcap_watcher_clone = mcap_watcher_b.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_new_token(
+                        &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
+                        &symbol_cache, executor.as_ref(),
+                        dev_watcher_clone.as_ref(),
+                        mcap_watcher_clone.as_ref(),
+                        tok,
+                    ).await {
+                        warn!(error=?e, "handle_new_token (band-crossing route) failed");
+                    }
+                });
+            }
+        });
+    }
+
     info!("listening for new pump.fun launches");
     while let Some(tok) = new_tokens.recv().await {
         info!(mint=%tok.mint, symbol=%tok.symbol, name=%tok.name, v_sol=?tok.v_sol, v_tokens=?tok.v_tokens, "📡 new token");
@@ -586,11 +664,13 @@ Wallet `{}`  cap `{} SOL`",
         let symbol_cache = symbol_cache.clone();
         let executor = executor.clone();
         let dev_watcher_clone = dev_watcher.clone();
+        let mcap_watcher_clone = mcap_watcher.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_new_token(
                 &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
                 &symbol_cache, executor.as_ref(),
                 dev_watcher_clone.as_ref(),
+                mcap_watcher_clone.as_ref(),
                 tok,
             ).await {
                 warn!(error=?e, "handle_new_token failed");
@@ -611,6 +691,7 @@ async fn handle_new_token(
     symbol_cache: &SymbolCache,
     executor: Option<&Arc<Executor>>,
     dev_watcher: Option<&crate::dev_watcher::DevWatcher>,
+    mcap_watcher: Option<&McapWatcher>,
     tok: pumpportal::NewToken,
 ) -> Result<()> {
     // 🛡️ Phase 3 Feature.3: record EVERY observed launch against its dev
@@ -724,7 +805,21 @@ async fn handle_new_token(
     let sol_usd = jup.sol_usd().await.unwrap_or(90.0);
     let decision = scanner::evaluate(cfg, &tok, sol_usd);
     if !decision.accept {
-        info!(mint=%tok.mint, reason=%decision.reason, "❌ filter reject");
+        // 2026-05-14: If mcap_watcher is enabled AND the rejection is
+        // "low_mcap" (token is below entry band), enroll it for watching
+        // instead of dropping. The watcher will re-route it back through
+        // this function when its mcap crosses INTO the band.
+        let enrolled = if let Some(w) = mcap_watcher {
+            if decision.reason.starts_with("low_mcap") {
+                w.enroll(&tok).await;
+                true
+            } else { false }
+        } else { false };
+        if !enrolled {
+            info!(mint=%tok.mint, reason=%decision.reason, "❌ filter reject");
+        } else {
+            debug!(mint=%tok.mint, reason=%decision.reason, "📌 enrolled for mcap watch (below entry band)");
+        }
         let _ = db.record_rejection(&tok.mint, &decision.reason);
         state.lock().await.release_entry_reservation(&tok.mint);
         return Ok(());

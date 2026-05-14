@@ -15,6 +15,9 @@ pub struct Config {
     pub paper: Paper,
     #[serde(default)]
     pub jito: Jito,
+    /// Mcap-progression watcher (2026-05-14). See `McapWatcher`.
+    #[serde(default)]
+    pub mcap_watcher: McapWatcher,
 }
 
 /// Jito Block Engine integration. When `enabled = true`, every live tx is
@@ -385,6 +388,30 @@ pub struct Filters {
 }
 
 fn default_reject_mayhem() -> bool { true }
+
+/// Mcap-progression watcher (2026-05-14). When enabled, fresh launches at
+/// seed price are enrolled into a watch list and re-evaluated for entry
+/// when their mcap crosses INTO the configured [min,max] band. Lets the
+/// bot trade pre-graduation tokens ($50-70k) without missing them because
+/// the `subscribeNewToken` stream only fires at seed price.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McapWatcher {
+    /// Master switch. Default OFF for back-compat with existing configs.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Drop watched candidates that have sat without a curve update for
+    /// this many seconds. Default 1800 (30 min). Most rugs die in <10 min;
+    /// graduates take 5-120 min from launch.
+    #[serde(default = "default_mcap_watcher_ttl")]
+    pub ttl_secs: u64,
+    /// Cap on simultaneously-watched candidates. Each occupies one
+    /// `subscribeTokenTrade` key on the PumpPortal WS. Default 2000.
+    #[serde(default = "default_mcap_watcher_cap")]
+    pub max_candidates: usize,
+}
+
+fn default_mcap_watcher_ttl() -> u64 { 1800 }
+fn default_mcap_watcher_cap() -> usize { 2000 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rpc {

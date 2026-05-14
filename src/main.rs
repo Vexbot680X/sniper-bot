@@ -20,6 +20,7 @@ mod executor;
 mod jito;
 mod pump_ix;
 mod pumpportal_trade;
+mod mcap_watcher;
 
 /// sniper-bot — Solana pump.fun sniper (paper + live).
 #[derive(Parser, Debug)]

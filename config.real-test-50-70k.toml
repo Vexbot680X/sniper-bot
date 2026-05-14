@@ -1,0 +1,200 @@
+# sniper-bot config — REAL TEST mode (2026-05-13 13:08 UTC)
+#
+# PURPOSE: real strategy validation now that the plumbing works. Graduated
+# out of dust. Killer-feature (rug-watcher auto-exit) is ON. Goal: 10-20
+# trades, max -$7 session risk, target measurable win-rate signal.
+#
+# Key diffs vs config.dust-jito.toml (the dust run that proved Jito works):
+#   - position_size_sol      = 0.005 (was 0.001)   -> ~$0.47/trade vs ~$0.09
+#   - live_max_position_sol  = 0.005 (was 0.001)   -> hard cap matches size
+#   - rug_watcher_alert_only = false (was true)    -> AUTO-EXIT on dev dump (THE KILLER FEATURE)
+#   - jito.tip_lamports      = 1_000              -> kept tiny; Jito accepted at 1k in dust test
+#
+# Key diffs vs the May 12 LIVE config (the one that lost $25.93):
+#   - position_size_sol      = 0.005 (was 0.10)    -> 20x smaller
+#   - live_max_position_sol  = 0.005 (was 0.10)
+#   - rug_exit_mcap_usd      = 3000  (was 3700)    -> fixed the entry-floor footgun
+#   - confirm_timeout_secs   = 20                  -> NEW fire-and-confirm send path
+#   - max_curve_age_ms       = 1500                -> NEW stale-curve guard
+#
+# Run with:
+#   cargo run --release -- --config config.real-test.toml --confirm-live <phrase derived from 0.005 SOL>
+[trading]
+mode = "live"                    # paper | live
+# Live execution requires SNIPER_WALLET_PATH (default ~/.openclaw/workspace/secrets/sniper-bot-wallet.json)
+# and VAULT_WALLET_PATH (default ~/.openclaw/workspace/secrets/vault-wallet.json) plus HELIUS_API_KEY env vars.
+# DO NOT flip to live without reviewing LIVE_BUILD_REPORT.md and dust-testing first.
+starting_bankroll_usd = 500.0
+# LIVE-mode tx params (ignored in paper mode):
+slippage_bps = 1500             # 15% slippage — raised from 500 on 2026-05-10 17:51 UTC. Strategy v3: ACCEPT worse fills so we can ESCAPE positions before crowd dumps curve. Sell-side slippage was eating 50-80% of curve gains; tolerating worse fills is better than getting trapped in -35% TP exits.
+priority_fee_percentile = 75    # 75th percentile of recent priority fees
+
+# 🚀 LATENCY (2026-05-13): tx send/confirm tuning. Replaces the old
+# `send_and_confirm_transaction_with_spinner` path (~30s default timeout,
+# 500ms polls, RPC-side retries). New path: skip_preflight=true + max_retries=0,
+# custom poll loop on get_signature_statuses every confirm_poll_interval_ms.
+confirm_timeout_secs = 20         # declare send failed after this many seconds without confirmation
+confirm_poll_interval_ms = 400    # how often to ask the RPC if our tx confirmed
+
+# 🛡️ STALE-CURVE GUARD (2026-05-13): max ms between WS receive time and
+# the buy decision. If our handler queue lagged longer than this, the
+# curve depth in the NewToken event is no longer trustworthy and we refuse
+# the entry. Set to 0 to disable.
+max_curve_age_ms = 1500
+# Fixed position size in SOL. Always sized at this many SOL converted to USD
+# at decision time using current sol_usd. When > 0, overrides position_size_pct.
+# 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
+# to 0.005 per PHASE_3_PLAN.md — smaller positions = smaller fee drag relative
+# to rug-detection edge, AND smaller blast radius for any safety feature bug.
+position_size_sol = 0.05        # 🚨 AGGRESSIVE 2026-05-14 14:27 — Mamba elected to skip tier-gate. JUMP from 0.01 to 0.05 SOL (5x) at SAME $3.5-5k mcap band. WARNING: this is Rule #3 territory (~10% of curve depth, not <5%) and Rule #18 violation (14 trades not 20 at previous tier). Target: $1.80/trade requires +39% avg at this size. Today's avg is +19.6% at 0.01 SOL — edge will be eaten by slippage at this size. May 12 round 3 had identical setup (0.05 SOL @ $3.5-5k, killer feature on) → -$2.39 net over 9 trades. We're testing whether the new audit-trail/dev-rep filters change that outcome. Stop conditions: -3 trades in a row, or session loss >$5, or 20 trades completed.
+position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
+
+# 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
+# The bot refuses any LIVE buy that would exceed this many SOL, regardless of
+# what position_size_sol or any other math says. Paper mode ignores this.
+# Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
+live_max_position_sol = 0.05    # 🚨 AGGRESSIVE 2026-05-14 14:27 — hard cap matches position_size_sol. New confirm-phrase required.
+take_profit_pct = 30.0           # 🆕 50-70K 2026-05-14 15:35 — wider TP. Pre-grad pumps to $69k play out over minutes; +30% on 0.05 SOL ($4.57) = ~$1.37 gross win.
+stop_loss_pct = 10.0             # 🆕 50-70K 2026-05-14 — -10% stop. Tight enough to cap rug damage, loose enough not to whipsaw on normal pre-grad volatility.
+max_concurrent_positions = 1    # 🛡️ LIVE 2026-05-12 16:11 — REDUCED FROM 5. Race fix shipped 2026-05-13 (commit fd680dc) verified by unit tests; staying at 1 for dust validation.
+max_hold_seconds = 180          # 🆕 50-70K 2026-05-14 — 3-min hold. Pre-grad pumps need minutes; 20s was for $3-5k mcap micro-scalps.
+# Rug exit: if open position's mcap collapses below this, force-close.
+# USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
+rug_exit_mcap_usd = 40000.0      # 🆕 50-70K 2026-05-14 — -20% mcap drop = bail. Entry floor $50k, this is 20% below → same buffer as old config (14%) but scaled.
+rug_exit_mcap_sol = 0.0         # legacy SOL floor, disabled when rug_exit_mcap_usd > 0
+
+# 🛡️ SAFETY (Phase 3.Safety.1): book↔chain reconciliation guard.
+# Refuses live startup if state.json book total disagrees with on-chain
+# balance by more than `reconciliation_tolerance_pct`. Auto-skipped on
+# paper mode, fresh state, or when open positions exist.
+reconciliation_required = true         # 🔒 AGGRESSIVE 2026-05-14 14:35 — Mamba enabled per Rule #5. Reconciliation done manually: 0 ghost holdings, 0 orphan trades. Going forward this guard refuses startup on chain↔books drift >5%.
+reconciliation_tolerance_pct = 0.05    # 5%
+
+# 🛡️ FEATURE (Phase 3.Feature.1): pre-buy exit-slippage gate.
+# Estimates the slippage of selling our position back into the CURRENT
+# curve depth (worst-realistic-exit model). Refuses entries where the
+# estimate exceeds the threshold. Closes the JOHNPORK-style failure.
+pre_buy_slippage_required = true
+pre_buy_slippage_threshold_pct = 0.10  # 10% — refuse if estimated >= this
+pre_buy_fee_bps_per_side = 100         # pump.fun documented swap fee
+
+# 🛡️ FEATURE (Phase 3.Feature.2): scale-out exits.
+# Every LIVE exit (TP/SL/timeout/rug/forced) is sold in N tranches with
+# a delay between each, instead of one big market sell. Reduces aggregate
+# exit slippage by ~40-60% at our band-scalp depth range. Each tranche
+# reads current balance so partial fills self-correct.
+scale_out_enabled = false  # 🔒 LIVE 2026-05-12 16:31 — DISABLED. Mamba wants single-order sells for speed. One sell tx = full size, faster exit, no tranche-3 race condition.
+scale_out_tranches = 3
+scale_out_delay_ms = 500
+
+# 🛡️ FEATURE (Phase 3.Feature.3): pre-buy dev vetting.
+# Every NewToken event is recorded against its dev pubkey. At entry time:
+#   - If dev is on `dev_blacklist`, refuse immediately (manual operator flag).
+#   - If dev has launched > N distinct tokens in the last 24h, refuse
+#     (overwhelmingly likely serial rugger).
+# Cheapest filter we run — one indexed-table query per token.
+dev_vetting_required = true
+dev_vetting_max_launches_24h = 3
+
+# 🛡️ FEATURE (Phase 3.Feature.5): dev wallet WS rug-watcher.
+# Every open live position subscribes its dev_pubkey to a Helius logsSubscribe
+# stream. Any tx the dev signs that touches the pump.fun program triggers a
+# DevDumpAlert. With alert_only=true, alerts are telegrammed but no auto-exit.
+# With alert_only=false, alerts queue the position for emergency exit
+# (bypassing TP/SL/timeout) with exit_reason="dev_dump_detected".
+#
+# rug_watcher_alert_only = true (DEFAULT for Phase B initial validation)
+# Flip to false only after measuring false-positive rate on real data.
+rug_watcher_enabled = true
+rug_watcher_alert_only = false  # 🔑 REAL-TEST 2026-05-13 — AUTO-EXIT ENABLED (THE KILLER FEATURE). Dust run proved the alert path fires correctly (3 detections on Jianguo trade, ~10s before stop-loss caught the dump). Flipping to auto-sell on dev dump is the highest-EV change we have.
+
+[skim]
+# Continuous profit skim: on every winning close, move skim_pct of the realized
+# gain to a sidelined `vault_usd` balance. Vault is one-way — never withdrawn back
+# into trading bankroll. Telegram alerts on each skim and on bankroll depletion.
+enabled = true
+skim_pct = 50.0
+# Alert when trading bankroll < (depletion_concurrent_floor * position_size_sol * sol_usd).
+# E.g. 5 → alert when bankroll can't fill all 5 concurrent slots.
+depletion_concurrent_floor = 5.0
+
+[scanner]
+scan_interval_seconds = 10
+position_check_interval_seconds = 2     # 🔒 STRATEGY v3 2026-05-10 17:51 UTC — 5x faster polling (was 10s). Critical for catching exits before crowd.
+heartbeat_interval_seconds = 300
+
+[filters]
+# Sanity filters on pump.fun firehose.
+# Pump.fun launches all start with ~30 SOL virtual liquidity, so liquidity is
+# meaningless at launch — market cap is the real selectivity lever.
+# Graduation to Raydium happens ~460 SOL mcap (~$69k). Tier guide:
+#   50  SOL  (~$7.5k)  — early but filters deadest launches
+#   200 SOL  (~$30k)   — proven momentum, halfway to graduation
+#   460 SOL  (~$69k)   — graduation candidates only
+# Mcap floor: USD-denominated takes precedence when set; bot converts to SOL
+# at decision time using current sol_usd — always self-consistent.
+min_market_cap_usd = 50000.0     # 🆕 50-70K 2026-05-14 15:35 — NEW STRATEGY: bonding-curve mid-band. Tokens that reached $50k have survived initial bundler dump phase; curve depth here is ~10x deeper than $3-5k. Rule #3: 0.05 SOL = ~1% of curve depth ✅.
+max_market_cap_usd = 70000.0     # 🆕 50-70K 2026-05-14 — just below pump.fun graduation threshold (~$69k). Catch the final push to grad + initial post-grad pump if hold-time covers migration.
+min_market_cap_sol = 0.0        # legacy SOL floor, disabled when min_market_cap_usd > 0
+require_mint_renounced = true
+require_no_freeze_authority = true
+max_top10_holder_pct = 80.0
+min_token_age_seconds = 0       # 0 = brand new ok
+max_token_age_seconds = 180     # extended from 60 → 180s on 2026-05-10 17:32 UTC. Strategy experiment: wider window to include tokens that survived first minute (more proven, less rug risk). Paper data was 0-60s only — this is uncharted.
+
+# Mayhem mode = pump.fun's optional 24h AI-driven market-maker mode (doubles
+# supply to 2B, AI agent randomly buys/sells the other 1B). Volatile, unpredictable,
+# not a fit for our 5min strategy. PumpPortal WS event has `is_mayhem_mode` flag
+# that we check directly.
+reject_mayhem_mode = true        # 🔒 LIVE BOT RULES — skip mayhem-mode launches
+
+[rpc]
+# Endpoint resolved at runtime by src/rpc.rs:
+#  1. If HELIUS_API_KEY env var is set, that key is used (preferred).
+#  2. Otherwise, if this string contains "api-key=..." and not "PUBLIC",
+#     it's used verbatim (local-only override).
+#  3. Otherwise, falls back to public mainnet RPC (logs a warning).
+# Keep the literal "PUBLIC" placeholder here so secrets never enter git history.
+# Set HELIUS_API_KEY in `secrets.env` for live operation.
+helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=PUBLIC"
+jupiter_quote_url = "https://lite-api.jup.ag/swap/v1/quote"  # updated 2026-05-10 — old quote-api.jup.ag/v6/quote returns HTTP 000, Jupiter migrated to lite-api.jup.ag/swap/v1. Was silently falling back to $90 SOL_USD const.
+pumpportal_ws = "wss://pumpportal.fun/api/data"
+
+[telegram]
+# Set via env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+enabled = true
+
+# ⚡ Jito Block Engine integration. When enabled, every live tx is also
+# submitted to Jito as a [tip_tx, trade_tx] bundle in parallel with the
+# regular Helius submission. Solana dedups by signature — only one inclusion
+# can land. If Jito wins (typically faster), the tip is paid; if Helius wins,
+# the bundle is rejected and we pay no tip.
+#
+# Why dual-submit: Jito has had multi-hour outages. Helius parallel-path is
+# insurance against missed trades during Jito downtime.
+#
+# Cost math: 100k lamports = 0.0001 SOL ≈ $0.01 per trade. On 19 trades today
+# that would have been ~$0.20 total in tips.
+[jito]
+enabled = true                            # 🧪 DUST-TEST 2026-05-13 — THIS IS WHAT WE'RE TESTING.
+endpoint = "https://mainnet.block-engine.jito.wtf"
+tip_lamports = 1_000                      # 🧪 DUST-TEST — 0.000001 SOL = ~$0.0001/tx. Min-viable tip to verify bundle path.
+tip_max_lamports = 100_000                # 🧪 DUST-TEST — lowered cap so a config typo can't burn real money.
+dual_submit = true                        # always.
+
+[storage]
+db_path = "data/sniper.db"
+state_path = "data/state.json"
+log_dir = "logs"
+
+# 🆕 MCAP-PROGRESSION WATCHER (2026-05-14)
+# When enabled, fresh launches at seed-price ($2-3k) are NOT just rejected.
+# They're enrolled into a watch list, the bot subscribes to their trade
+# events, and when their mcap climbs into [min_market_cap_usd,
+# max_market_cap_usd] the bot fires entry as if it were a fresh-token event.
+# Without this, the bot would never enter at $50-70k mcap because the
+# `subscribeNewToken` stream only emits at seed price.
+[mcap_watcher]
+enabled = true
+ttl_secs = 1800           # 30 min before we forget a watched candidate.
+max_candidates = 2000     # cap simultaneously-tracked mints.
