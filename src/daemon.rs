@@ -1,6 +1,7 @@
 use crate::bonding_curve::{CurveSubscriber, CurveTracker};
 use crate::mcap_watcher::{McapWatcher, WatcherCfg, JupiterSolUsd, BandCrossing};
 use crate::momentum_detector::{MomentumDetector, MomentumCfg, MomentumSignal};
+use crate::livestream_poller::{LivestreamPoller, LivestreamCfg, LivestreamSignal, to_new_token as livestream_to_new_token};
 use solana_sdk::signer::Signer;
 use crate::config::Config;
 use crate::executor::Executor;
@@ -316,6 +317,35 @@ Wallet `{}`  cap `{} SOL`",
     // max_market_cap_usd], we receive a `BandCrossing` event and route it
     // back through `handle_new_token` (with synthesized v_sol/v_tokens).
     // Master switch: `[mcap_watcher] enabled = true` in config.
+    // 2026-05-14: Livestream poller. HTTP-polls pump.fun's currently-live
+    // endpoint and fires entries on coins actively streaming with real
+    // audience engagement. Independent of curve/WS plumbing.
+    let mut livestream_rx: Option<tokio::sync::mpsc::Receiver<LivestreamSignal>> = if cfg.livestream.enabled {
+        let lcfg = LivestreamCfg {
+            poll_interval_secs: cfg.livestream.poll_interval_secs,
+            min_participants: cfg.livestream.min_participants,
+            min_mcap_usd: cfg.livestream.min_mcap_usd,
+            max_mcap_usd: cfg.livestream.max_mcap_usd,
+            min_age_secs: cfg.livestream.min_age_secs,
+            max_age_secs: cfg.livestream.max_age_secs,
+            skip_nsfw: cfg.livestream.skip_nsfw,
+            fetch_limit: cfg.livestream.fetch_limit,
+            dedup_cap: cfg.livestream.dedup_cap,
+        };
+        let rx = LivestreamPoller::spawn(lcfg);
+        info!(
+            poll_interval_secs=cfg.livestream.poll_interval_secs,
+            min_participants=cfg.livestream.min_participants,
+            min_mcap_usd=cfg.livestream.min_mcap_usd,
+            max_mcap_usd=cfg.livestream.max_mcap_usd,
+            min_age_secs=cfg.livestream.min_age_secs,
+            max_age_secs=cfg.livestream.max_age_secs,
+            skip_nsfw=cfg.livestream.skip_nsfw,
+            "🎥 livestream_poller ENABLED"
+        );
+        Some(rx)
+    } else { None };
+
     // 2026-05-14: Momentum detector. Opens a SECOND PumpPortal WS, tracks
     // rolling 6-min volume buckets per mint, fires MomentumSignal when
     // short-window volume >> long-window baseline AND mcap is rising.
@@ -630,6 +660,47 @@ Wallet `{}`  cap `{} SOL`",
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // 2026-05-14: Spawn a background task to receive `LivestreamSignal`
+    // events and route them through `handle_new_token`. Same filter
+    // chain runs — only the trigger differs.
+    if let Some(mut rx) = livestream_rx.take() {
+        let cfg_l = cfg.clone(); let db_l = db.clone(); let state_l = state.clone();
+        let tg_l = tg.clone(); let jup_l = jup.clone(); let curves_l = curves.clone();
+        let curve_sub_l = curve_sub.clone();
+        let symbol_cache_l = symbol_cache.clone();
+        let executor_l = executor.clone();
+        let dev_watcher_l = dev_watcher.clone();
+        let mcap_watcher_l = mcap_watcher.clone();
+        tokio::spawn(async move {
+            while let Some(sig) = rx.recv().await {
+                info!(
+                    mint=%sig.mint, symbol=%sig.symbol, mcap_usd=sig.usd_market_cap,
+                    participants=sig.num_participants, age_secs=sig.age_secs,
+                    "📨 livestream signal — routing to entry path"
+                );
+                let tok = livestream_to_new_token(&sig);
+                let cfg = cfg_l.clone(); let db = db_l.clone(); let state = state_l.clone();
+                let tg = tg_l.clone(); let jup = jup_l.clone(); let curves = curves_l.clone();
+                let curve_sub = curve_sub_l.clone();
+                let symbol_cache = symbol_cache_l.clone();
+                let executor = executor_l.clone();
+                let dev_watcher_clone = dev_watcher_l.clone();
+                let mcap_watcher_clone = mcap_watcher_l.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_new_token(
+                        &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
+                        &symbol_cache, executor.as_ref(),
+                        dev_watcher_clone.as_ref(),
+                        mcap_watcher_clone.as_ref(),
+                        tok,
+                    ).await {
+                        warn!(error=?e, "handle_new_token (livestream route) failed");
+                    }
+                });
             }
         });
     }

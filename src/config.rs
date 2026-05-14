@@ -21,6 +21,9 @@ pub struct Config {
     /// Momentum detector (2026-05-14). See `Momentum`.
     #[serde(default)]
     pub momentum: Momentum,
+    /// Livestream poller (2026-05-14). See `Livestream`.
+    #[serde(default)]
+    pub livestream: Livestream,
 }
 
 /// Jito Block Engine integration. When `enabled = true`, every live tx is
@@ -454,6 +457,32 @@ fn default_momentum_min_mcap_sol() -> f64 { 100.0 }
 fn default_momentum_min_rise() -> f64 { 10.0 }
 fn default_momentum_sweep_ms() -> u64 { 1000 }
 fn default_momentum_max_mints() -> usize { 5000 }
+
+/// Livestream poller (2026-05-14). HTTP-polls pump.fun's currently-live
+/// endpoint and fires entries on coins that are actively streaming with
+/// real audience engagement. See `src/livestream_poller.rs`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Livestream {
+    #[serde(default)] pub enabled: bool,
+    #[serde(default = "default_ls_poll")]      pub poll_interval_secs: u64,
+    #[serde(default = "default_ls_min_part")]   pub min_participants: u32,
+    #[serde(default = "default_ls_min_mcap")]   pub min_mcap_usd: f64,
+    #[serde(default = "default_ls_max_mcap")]   pub max_mcap_usd: f64,
+    #[serde(default = "default_ls_min_age")]    pub min_age_secs: i64,
+    #[serde(default = "default_ls_max_age")]    pub max_age_secs: i64,
+    #[serde(default = "default_ls_skip_nsfw")]  pub skip_nsfw: bool,
+    #[serde(default = "default_ls_fetch_limit")] pub fetch_limit: u32,
+    #[serde(default = "default_ls_dedup_cap")]  pub dedup_cap: usize,
+}
+fn default_ls_poll() -> u64 { 5 }
+fn default_ls_min_part() -> u32 { 30 }
+fn default_ls_min_mcap() -> f64 { 2000.0 }
+fn default_ls_max_mcap() -> f64 { 30000.0 }
+fn default_ls_min_age() -> i64 { 30 * 60 }
+fn default_ls_max_age() -> i64 { 60 * 60 }
+fn default_ls_skip_nsfw() -> bool { true }
+fn default_ls_fetch_limit() -> u32 { 50 }
+fn default_ls_dedup_cap() -> usize { 5000 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rpc {
