@@ -133,7 +133,7 @@ heartbeat_interval_seconds = 300
 #   460 SOL  (~$69k)   — graduation candidates only
 # Mcap floor: USD-denominated takes precedence when set; bot converts to SOL
 # at decision time using current sol_usd — always self-consistent.
-min_market_cap_usd = 20000.0     # 📈 MOMENTUM 2026-05-14 17:10 — WIDE band. The real gate is the momentum spike detector below; this is just a sanity floor (skip dust pumps under $20k).
+min_market_cap_usd = 8000.0      # 🔧 FIXED 2026-05-14 17:49 — was 0 (DISASTER: turned bot into fresh-seed buyer, 32 trades / 16% WR / -$7.38 in 12 min). Now $8k floor filters fresh seeds; tokens must show first signs of life before we touch them. The mcap_watcher (re-enabled below) routes tokens that CLIMB into this band; the momentum detector independently catches spikes above $8k.
 max_market_cap_usd = 500000.0    # 📈 MOMENTUM — wide ceiling at $500k. If an old coin moons through $500k it's gone past our entry window anyway; this catches everything else.
 min_market_cap_sol = 0.0        # legacy SOL floor, disabled when min_market_cap_usd > 0
 require_mint_renounced = true
@@ -194,10 +194,12 @@ log_dir = "logs"
 # max_market_cap_usd] the bot fires entry as if it were a fresh-token event.
 # Without this, the bot would never enter at $50-70k mcap because the
 # `subscribeNewToken` stream only emits at seed price.
-# 📈 MOMENTUM 2026-05-14 17:10 — disable the mcap_watcher entry path; the
-# momentum detector below is the active entry-trigger source.
+# 🔧 FIXED 2026-05-14 17:49 — RE-ENABLED. With mcap floor restored to $8k,
+# the mcap_watcher enrolls fresh launches and routes them when they CLIMB
+# into [min_market_cap_usd, max_market_cap_usd] = $8k-$500k. The momentum
+# detector below catches spike-style entries on top of that.
 [mcap_watcher]
-enabled = false
+enabled = true
 ttl_secs = 1800
 max_candidates = 2000
 
