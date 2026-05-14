@@ -364,6 +364,12 @@ impl Db {
     /// misleading we can switch this to `mode = 'live'`.
     pub fn recompute_dev_reputation(&self, dev_pubkey: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // HEALTH-AUDIT (2026-05-14 v2): rug_exits counts ONLY trades where we
+        // BOTH had a rug-shaped exit reason AND lost money. A rug-watcher
+        // exit that successfully caught the dev's dump at a profit is a WIN
+        // for our strategy — it should not penalize the dev's score.
+        // Otherwise the killer feature would (paradoxically) push winning
+        // devs to the rug-fatal floor.
         let mut stmt = conn.prepare(
             "SELECT
                 COUNT(*),
@@ -371,7 +377,7 @@ impl Db {
                 COALESCE(SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(pnl_usd), 0.0),
                 COALESCE(AVG(pnl_pct), 0.0),
-                COALESCE(SUM(CASE WHEN exit_reason LIKE 'rug%' OR exit_reason LIKE 'dev_%' OR exit_reason = 'rug_watcher' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pnl_usd < 0 AND (exit_reason LIKE 'rug%' OR exit_reason LIKE 'dev_%' OR exit_reason = 'rug_watcher') THEN 1 ELSE 0 END), 0),
                 MAX(exited_at)
              FROM trades WHERE dev_pubkey = ?1",
         )?;
@@ -721,6 +727,7 @@ mod dev_reputation_tests {
     fn rug_exit_reasons_are_counted() {
         let db = db();
         let dev = "DEV_RUGGY";
+        // r1, r2: rug-shaped exit reason AND lost money -> count as rugs
         db.record_trade(&rec("r1", Some(dev), -0.8, -80.0, "rug_watcher")).unwrap();
         db.record_trade(&rec("r2", Some(dev), -0.7, -70.0, "rug_dev_sold")).unwrap();
         db.record_trade(&rec("r3", Some(dev), 0.3, 30.0, "take_profit")).unwrap();
@@ -729,6 +736,26 @@ mod dev_reputation_tests {
         assert_eq!(rep.rug_exits, 2);
         // 2/3 rugs >= 0.5 -> hard floor.
         assert_eq!(rep.score, Some(-1.0));
+    }
+
+    #[test]
+    fn rug_watcher_exit_at_profit_is_not_a_rug() {
+        // HEALTH-AUDIT (2026-05-14 v2): the killer feature can exit a
+        // dev-dump position at a profit. That's a strategy WIN, not a rug
+        // against us. The scorer must not penalize the dev's score for
+        // trades we actually won — otherwise the rug-fatal floor would
+        // fire on devs we PROFIT from, which is the opposite of what we want.
+        let db = db();
+        let dev = "DEV_PROFITABLE_RUGGER";
+        db.record_trade(&rec("r1", Some(dev), 0.5, 50.0, "rug_watcher")).unwrap();
+        db.record_trade(&rec("r2", Some(dev), 0.3, 30.0, "dev_dump_detected")).unwrap();
+        db.record_trade(&rec("r3", Some(dev), 0.4, 40.0, "rug_watcher")).unwrap();
+        db.recompute_dev_reputation(dev).unwrap();
+        let rep = db.get_dev_reputation(dev).unwrap().unwrap();
+        // All 3 rug-shaped exits were WINS. rug_exits should be 0 —
+        // not 3 — so the dev is not pushed to the rug-fatal floor.
+        assert_eq!(rep.rug_exits, 0, "profitable rug-watcher exits must not count as rugs");
+        assert_ne!(rep.score, Some(-1.0), "profitable dev must not hit rug-fatal floor");
     }
 
     #[test]

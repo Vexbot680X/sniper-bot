@@ -973,6 +973,38 @@ impl Executor {
         wallet::transfer_sol(&self.rpc.client, &self.trading_kp, &self.vault_pubkey, lamports).await
     }
 
+    /// HEALTH-AUDIT (2026-05-14): fetch the on-chain fee charged for a tx.
+    ///
+    /// Returns `meta.fee` (in lamports) from `getTransaction`. This includes
+    /// the base network fee + per-CU priority fee. It does NOT include the
+    /// Jito tip when Jito was used (the tip is a separate transfer inside the
+    /// bundle, not the tx fee itself — if you also want the tip, parse the
+    /// bundle status separately). Returns `Ok(None)` on lookup failure (best-
+    /// effort: never fail a trade close on this call).
+    ///
+    /// Used by the close path to populate `trades.fees_lamports` so books
+    /// reflect actual on-chain cost, not just quote PnL.
+    pub async fn fetch_tx_fee_lamports(&self, sig: &Signature) -> Result<Option<u64>> {
+        let cfg = solana_rpc_client_api::config::RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        match self.rpc.client.get_transaction_with_config(sig, cfg).await {
+            Ok(tx) => {
+                if let Some(meta) = tx.transaction.meta {
+                    Ok(Some(meta.fee))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                warn!(error=?e, sig=%sig, "fetch_tx_fee_lamports failed; returning None");
+                Ok(None)
+            }
+        }
+    }
+
     /// Build the same instruction list `buy()` would submit, sign it as a tx, and
     /// run `simulateTransaction` against mainnet RPC. No broadcast. Used by the
     /// re-enable gate — we MUST get a successful sim against a real recently-launched

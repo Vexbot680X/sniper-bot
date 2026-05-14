@@ -108,6 +108,8 @@ pub fn open_position_paper(
         max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
         dev_pubkey,
         curve_sol_at_entry,
+        entry_sig: None,            // paper mode — no on-chain entry
+        entry_fee_lamports: None,   // paper mode — no on-chain fee
     };
     state.bankroll_usd -= size_usd; // earmark
     state.open_positions.insert(mint, pos.clone());
@@ -168,6 +170,14 @@ pub async fn open_position_live(
         // Live mode uses the real executor for fills, not the paper simulator;
         // this field is informational only for live positions.
         curve_sol_at_entry: None,
+        // HEALTH-AUDIT (2026-05-14): persist on-chain entry signature so we
+        // can later join trades ↔ live_attempts ↔ on-chain forensics. The
+        // BuyFill from executor.buy() carries the signature directly.
+        entry_sig: Some(fill.signature.to_string()),
+        // HEALTH-AUDIT (2026-05-14): fetch entry-side fee on a best-effort
+        // basis. Failures are silently None — don't block the position open
+        // on a meta lookup. fees_lamports on close will then = entry + exit.
+        entry_fee_lamports: executor.fetch_tx_fee_lamports(&fill.signature).await.ok().flatten().map(|f| f as i64),
     };
 
     {
@@ -390,6 +400,17 @@ pub async fn close_position_live(
 
     let now = Utc::now();
     let exit_sig_str = fill.signature.to_string();
+    // HEALTH-AUDIT (2026-05-14): real fee accounting. Sum entry-side fee
+    // (captured at open) + exit-side fee (fetched now). Best-effort: if
+    // either lookup failed we record what we have rather than zero.
+    // `meta.fee` excludes the Jito tip; tip is paid by a separate transfer
+    // inside the bundle, so for true "cost" reconciliation we add it back
+    // in a future pass. For now this captures network + priority fees,
+    // which is the bulk of per-trade cost variance.
+    let exit_fee_lamports = executor.fetch_tx_fee_lamports(&fill.signature)
+        .await.ok().flatten().unwrap_or(0) as i64;
+    let entry_fee_lamports = pos.entry_fee_lamports.unwrap_or(0);
+    let fees_lamports_total = entry_fee_lamports + exit_fee_lamports;
     let rec = TradeRecord {
         id: pos.id.clone(),
         mint: pos.mint.clone(),
@@ -404,12 +425,9 @@ pub async fn close_position_live(
         exit_reason: reason.to_string(),
         hold_seconds: (now - pos.entered_at).num_seconds(),
         mode: "live".to_string(),
-        // entry_sig is not currently captured in Position state. TODO: thread it through
-        // open_position_live — for now leave None and rely on `live_attempts` to find it.
-        entry_sig: None,
+        entry_sig: pos.entry_sig.clone(),
         exit_sig: Some(exit_sig_str.clone()),
-        // Fee accounting via on-chain getTransaction.meta.fee would go here; deferred.
-        fees_lamports: 0,
+        fees_lamports: fees_lamports_total,
         dev_pubkey: pos.dev_pubkey.clone(),
     };
     db.record_trade(&rec)?;
@@ -514,6 +532,8 @@ mod tests {
             max_hold_until: Utc::now() + chrono::Duration::seconds(hold_secs),
             dev_pubkey: None,
             curve_sol_at_entry: None,
+            entry_sig: None,
+            entry_fee_lamports: None,
         }
     }
 

@@ -100,6 +100,21 @@ pub struct Position {
     /// mode too for consistency / forensic value.
     #[serde(default)]
     pub curve_sol_at_entry: Option<f64>,
+
+    /// HEALTH-AUDIT (2026-05-14): on-chain entry tx signature. Live-mode only;
+    /// None in paper mode. Captured at fill so we can later join trades ↔
+    /// live_attempts ↔ on-chain via Solana explorers, and so the close-side
+    /// trade record can persist both entry_sig + exit_sig in the trades table.
+    #[serde(default)]
+    pub entry_sig: Option<String>,
+
+    /// HEALTH-AUDIT (2026-05-14): total fee lamports paid at entry (network +
+    /// priority + Jito tip). Captured by `getTransaction` after fill. None for
+    /// paper mode or pre-fix positions. The close path adds the exit-side fee
+    /// before writing the TradeRecord so trades.fees_lamports reflects both
+    /// sides.
+    #[serde(default)]
+    pub entry_fee_lamports: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -309,6 +324,8 @@ mod tests {
             max_hold_until: chrono::Utc::now() + chrono::Duration::seconds(60),
             dev_pubkey: None,
             curve_sol_at_entry: None,
+            entry_sig: None,
+            entry_fee_lamports: None,
         }
     }
 

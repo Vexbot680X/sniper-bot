@@ -31,6 +31,39 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 fn normalize_symbol(s: &str) -> String { s.trim().to_uppercase() }
 
+/// HEALTH-AUDIT (2026-05-14): classify a live-buy failure error string
+/// into (outcome, anchor_err) for the live_attempts table.
+///
+/// Outcomes match the schema-documented set:
+///   "sim_reject"        — pre-send simulate failed (caught locally)
+///   "submit_fail"       — tx broadcast itself failed (no on-chain landing)
+///   "buy_landed_failed" — tx landed on-chain but errored (rare; would need
+///                         signature inspection that we don't do yet)
+///   "buy_ok"            — success (not reached by this fn)
+///
+/// Anchor / Custom(N) errors are extracted when present so we can group
+/// failures by program error number (6002 = entry slippage, 2006 = PDA
+/// mismatch, 6005 = exit slippage, etc).
+pub fn classify_buy_failure(err: &str) -> (String, Option<i64>) {
+    let lower = err.to_ascii_lowercase();
+    // Try to extract Custom(N) anchor error number.
+    let anchor_err = lower.find("custom(")
+        .and_then(|i| lower[i+7..].split(')').next())
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let outcome = if lower.contains("simulate failed") || lower.contains("sim failed") || lower.contains("pre-send simulate") {
+        "sim_reject"
+    } else if lower.contains("submit") || lower.contains("broadcast") || lower.contains("sendtransaction") {
+        "submit_fail"
+    } else if lower.contains("landed") || lower.contains("on-chain") {
+        "buy_landed_failed"
+    } else {
+        // Default bucket — most pumpportal errors fall in here. They're
+        // pre-broadcast rejections in practice.
+        "submit_fail"
+    };
+    (outcome.to_string(), anchor_err)
+}
+
 fn is_live(cfg: &Config) -> bool { cfg.trading.mode.eq_ignore_ascii_case("live") }
 
 /// Run-time options passed in from the CLI.
@@ -471,24 +504,75 @@ Wallet `{}`  cap `{} SOL`",
     // Heartbeat
     {
         let cfg = cfg.clone(); let db = db.clone(); let state = state.clone();
+        let jup = jup.clone(); let executor = executor.clone(); let tg = tg.clone();
         tokio::spawn(async move {
             let interval = Duration::from_secs(cfg.scanner.heartbeat_interval_seconds);
+            // HEALTH-AUDIT (2026-05-14): rate-limit reconciliation alerts so
+            // we don't spam Telegram every heartbeat once a drift opens up.
+            let mut last_drift_alert: Option<chrono::DateTime<Utc>> = None;
             loop {
                 tokio::time::sleep(interval).await;
-                let mut s = state.lock().await;
-                s.last_heartbeat = Some(Utc::now());
-                let _ = db.record_heartbeat(s.bankroll_usd, s.open_positions.len(), s.stats.trades_total);
-                let _ = s.save(&cfg.storage.state_path);
-                info!(
-                    bankroll = s.bankroll_usd,
-                    vault = s.vault_usd,
-                    open = s.open_positions.len(),
-                    trades = s.stats.trades_total,
-                    wins = s.stats.wins,
-                    losses = s.stats.losses,
-                    pnl = s.stats.realized_pnl_usd,
-                    "💓 heartbeat"
-                );
+                let snapshot = {
+                    let mut s = state.lock().await;
+                    s.last_heartbeat = Some(Utc::now());
+                    let _ = db.record_heartbeat(s.bankroll_usd, s.open_positions.len(), s.stats.trades_total);
+                    let _ = s.save(&cfg.storage.state_path);
+                    info!(
+                        bankroll = s.bankroll_usd,
+                        vault = s.vault_usd,
+                        open = s.open_positions.len(),
+                        trades = s.stats.trades_total,
+                        wins = s.stats.wins,
+                        losses = s.stats.losses,
+                        pnl = s.stats.realized_pnl_usd,
+                        "💓 heartbeat"
+                    );
+                    (s.bankroll_usd, s.vault_usd, s.book_total_usd())
+                };
+
+                // HEALTH-AUDIT (2026-05-14): books-vs-chain reconciliation.
+                // Only runs in LIVE mode (executor present). Compares the
+                // bot's belief about its wealth (`book_total_usd`) against
+                // actual on-chain SOL value of the two wallets we control.
+                // Logs every cycle; alerts on Telegram if gap > $5 and we
+                // haven't alerted in the last 30 minutes.
+                if let Some(ex) = executor.as_ref() {
+                    let (books_bankroll, books_vault, books_total) = snapshot;
+                    let sol_usd = jup.sol_usd().await.unwrap_or(90.0);
+                    let trading_lamports = ex.sol_balance_lamports().await.unwrap_or(0);
+                    let vault_lamports = ex.vault_balance_lamports().await.unwrap_or(0);
+                    let chain_trading_usd = (trading_lamports as f64 / 1e9) * sol_usd;
+                    let chain_vault_usd   = (vault_lamports   as f64 / 1e9) * sol_usd;
+                    let chain_total = chain_trading_usd + chain_vault_usd;
+                    let drift_usd = books_total - chain_total;
+                    let drift_abs = drift_usd.abs();
+                    info!(
+                        books_total   = format!("{:.2}", books_total),
+                        books_bankroll= format!("{:.2}", books_bankroll),
+                        books_vault   = format!("{:.2}", books_vault),
+                        chain_total   = format!("{:.2}", chain_total),
+                        chain_trading = format!("{:.2}", chain_trading_usd),
+                        chain_vault   = format!("{:.2}", chain_vault_usd),
+                        drift_usd     = format!("{:+.2}", drift_usd),
+                        sol_usd       = format!("{:.2}", sol_usd),
+                        "📊 books-vs-chain reconciliation"
+                    );
+                    if drift_abs > 5.0 {
+                        let now = Utc::now();
+                        let should_alert = match last_drift_alert {
+                            None => true,
+                            Some(t) => (now - t).num_minutes() >= 30,
+                        };
+                        if should_alert {
+                            warn!(drift_usd, "⚠️ books-vs-chain drift exceeds $5");
+                            let _ = tg.send(&format!(
+                                "⚠️ *Books-vs-chain drift*: `${:+.2}`\nBooks total: `${:.2}`\nChain total: `${:.2}`\n(trading: `${:.2}`, vault: `${:.2}`)\nLikely sources: slippage, fees, failed-but-landed txs. Audit before sizing up.",
+                                drift_usd, books_total, chain_total, chain_trading_usd, chain_vault_usd
+                            )).await;
+                            last_drift_alert = Some(now);
+                        }
+                    }
+                }
             }
         });
     }
@@ -823,6 +907,14 @@ async fn handle_new_token(
                 let mut s = state.lock().await;
                 s.live_in_flight.insert(tok.mint.clone());
             }
+            // HEALTH-AUDIT (2026-05-14): timestamp the attempt before submit
+            // so the live_attempts row reflects when we tried, not when we
+            // got a result back (which can be seconds later on a slow RPC).
+            let attempted_at = chrono::Utc::now();
+            let attempt_size_lamports = (cfg.trading.position_size_sol * 1e9) as u64;
+            // PumpPortal slippage is a % (not bps) but we store bps for analytics consistency.
+            let attempt_slippage_bps = cfg.trading.slippage_bps;
+            let attempt_creator = resolved_dev_pubkey.clone().unwrap_or_default();
             let result = positions::open_position_live(
                 ex.as_ref(),
                 state,
@@ -843,12 +935,57 @@ async fn handle_new_token(
             }
             match result {
                 Ok(p) => {
+                    // HEALTH-AUDIT (2026-05-14): record successful buy in
+                    // live_attempts so we have a complete audit trail. The
+                    // trade_id links this row to the trades table once the
+                    // position eventually closes.
+                    let _ = db.record_live_attempt(&crate::storage::LiveAttempt {
+                        mint: tok.mint.clone(),
+                        symbol: symbol.clone(),
+                        attempted_at,
+                        size_sol_lamports: attempt_size_lamports,
+                        max_sol_cost_lamports: attempt_size_lamports, // PumpPortal handles slippage internally
+                        slippage_bps: attempt_slippage_bps,
+                        priority_fee_micro_lamports: None, // PumpPortal-managed
+                        creator_pubkey: attempt_creator.clone(),
+                        bc_present: true, // we got curve state to enter
+                        outcome: "buy_ok".to_string(),
+                        anchor_err: None,
+                        tx_sig: p.entry_sig.clone(),
+                        error_detail: None,
+                        trade_id: Some(p.id.clone()),
+                    });
                     // Reset failure counter on success
                     let mut s = state.lock().await;
                     s.live_consecutive_failures = 0;
                     p
                 }
                 Err(e) => {
+                    // HEALTH-AUDIT (2026-05-14): classify failure outcome
+                    // from the error string so we can aggregate patterns.
+                    // Pump.fun Custom(N) errors:
+                    //   2006 = ConstraintSeeds (PDA mismatch)
+                    //   3012 = AccountNotInitialized
+                    //   6002 = TooMuchSolRequired (entry slippage)
+                    //   6005 = TooLittleSolReceived (exit slippage)
+                    let err_str = format!("{e}");
+                    let (outcome, anchor_err) = classify_buy_failure(&err_str);
+                    let _ = db.record_live_attempt(&crate::storage::LiveAttempt {
+                        mint: tok.mint.clone(),
+                        symbol: symbol.clone(),
+                        attempted_at,
+                        size_sol_lamports: attempt_size_lamports,
+                        max_sol_cost_lamports: attempt_size_lamports,
+                        slippage_bps: attempt_slippage_bps,
+                        priority_fee_micro_lamports: None,
+                        creator_pubkey: attempt_creator,
+                        bc_present: true,
+                        outcome,
+                        anchor_err,
+                        tx_sig: None,
+                        error_detail: Some(err_str.clone()),
+                        trade_id: None,
+                    });
                     error!(mint=%tok.mint, error=?e, "❌ LIVE buy failed");
                     let _ = db.record_rejection(&tok.mint, &format!("live_buy_failed: {e}"));
                     let trip = {
@@ -1319,5 +1456,48 @@ mod live_confirmation_tests {
         let phrase = live_confirm_phrase(PK, 0.005);
         let typoed = phrase.replace("confirm", "comfirm"); // sneaky typo
         assert!(check_live_confirmation(Some(&typoed), PK, 0.005).is_err());
+    }
+
+    // HEALTH-AUDIT (2026-05-14): classify_buy_failure tests.
+
+    #[test]
+    fn classify_sim_reject_with_custom_error() {
+        let (outcome, anchor) = classify_buy_failure(
+            "pumpportal buy: pre-send simulate failed: InstructionError(3, Custom(6002))"
+        );
+        assert_eq!(outcome, "sim_reject");
+        assert_eq!(anchor, Some(6002));
+    }
+
+    #[test]
+    fn classify_sim_reject_pda_mismatch() {
+        let (outcome, anchor) = classify_buy_failure(
+            "pumpportal buy: pre-send simulate failed: InstructionError(3, Custom(2006))"
+        );
+        assert_eq!(outcome, "sim_reject");
+        assert_eq!(anchor, Some(2006));
+    }
+
+    #[test]
+    fn classify_submit_fail_default_bucket() {
+        let (outcome, anchor) = classify_buy_failure("buy failed: rpc timeout");
+        assert_eq!(outcome, "submit_fail");
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn classify_extracts_exit_slippage_anchor() {
+        let (outcome, anchor) = classify_buy_failure(
+            "pumpportal sell: pre-send simulate failed: InstructionError(3, Custom(6005))"
+        );
+        assert_eq!(outcome, "sim_reject");
+        assert_eq!(anchor, Some(6005));
+    }
+
+    #[test]
+    fn classify_no_custom_returns_none_anchor() {
+        let (outcome, anchor) = classify_buy_failure("submit tx: connection reset");
+        assert_eq!(outcome, "submit_fail");
+        assert_eq!(anchor, None);
     }
 }
