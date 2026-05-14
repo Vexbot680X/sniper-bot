@@ -311,10 +311,38 @@ async fn run_once(
                 };
                 if mints_for_dev.is_empty() { continue; }
 
+                // 🔧 ATA-debit gating (2026-05-14 from code-audit recommendation):
+                // Old behavior: alerted on ANY dev tx mentioning pump.fun program —
+                // which fires on dev BUYS, account updates, fee-recipient mentions,
+                // and any harmless dev activity. That caused false-positive rug_collapse
+                // exits all afternoon. New behavior: require BOTH (a) the anchor log
+                // line "Instruction: Sell" appears in the tx logs, AND (b) the specific
+                // mint we hold appears in the logs. (a) means it's a sell instruction.
+                // (b) means it's a sell of THIS mint, not some other token the dev owns.
+                // Together these convert "any dev activity" into "dev sold this specific
+                // token" — the actual signal we want.
+                let is_sell = logs.iter().any(|l| l.contains("Instruction: Sell"));
+                if !is_sell {
+                    debug!(%dev, signature, "dev_watcher: dev tx but not a Sell instruction — ignoring");
+                    continue;
+                }
+
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                for mint in mints_for_dev {
+                let mut fired = 0;
+                for mint in &mints_for_dev {
+                    // Mint match: any of the logs (which include program-data, account
+                    // mentions, etc) reference the mint pubkey. PumpPortal-built sell
+                    // txs always reference the mint in logs via
+                    //   `Program log: Sell { mint: <mint>, ... }`
+                    // and via the account list dump. If the mint isn't in the logs at
+                    // all, this Sell was for a different token — skip.
+                    let mint_in_logs = logs.iter().any(|l| l.contains(mint));
+                    if !mint_in_logs {
+                        debug!(%dev, %mint, signature, "dev_watcher: Sell instruction but mint not referenced in logs — different token");
+                        continue;
+                    }
                     let alert = DevDumpAlert {
-                        mint,
+                        mint: mint.clone(),
                         dev_pubkey: dev.clone(),
                         dev_signature: signature.to_string(),
                         detected_at_ms: now_ms,
@@ -322,6 +350,12 @@ async fn run_once(
                     if alert_tx.send(alert).await.is_err() {
                         return Ok(()); // daemon shutting down
                     }
+                    fired += 1;
+                }
+                if fired > 0 {
+                    info!(%dev, signature, fired, "🚨 dev_watcher: SELL detected on watched mint(s) — firing exit alert");
+                } else {
+                    debug!(%dev, signature, watched=mints_for_dev.len(), "dev_watcher: dev Sell, but no watched mint matched");
                 }
             }
         }
