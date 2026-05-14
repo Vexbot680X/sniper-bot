@@ -1,5 +1,6 @@
 use crate::bonding_curve::{CurveSubscriber, CurveTracker};
 use crate::mcap_watcher::{McapWatcher, WatcherCfg, JupiterSolUsd, BandCrossing};
+use crate::momentum_detector::{MomentumDetector, MomentumCfg, MomentumSignal};
 use solana_sdk::signer::Signer;
 use crate::config::Config;
 use crate::executor::Executor;
@@ -315,6 +316,33 @@ Wallet `{}`  cap `{} SOL`",
     // max_market_cap_usd], we receive a `BandCrossing` event and route it
     // back through `handle_new_token` (with synthesized v_sol/v_tokens).
     // Master switch: `[mcap_watcher] enabled = true` in config.
+    // 2026-05-14: Momentum detector. Opens a SECOND PumpPortal WS, tracks
+    // rolling 6-min volume buckets per mint, fires MomentumSignal when
+    // short-window volume >> long-window baseline AND mcap is rising.
+    // Targets "older coin pops off" — not fresh-launch chaos.
+    let mut momentum_rx: Option<tokio::sync::mpsc::Receiver<MomentumSignal>> = if cfg.momentum.enabled {
+        let mcfg = MomentumCfg {
+            min_age_secs: cfg.momentum.min_age_secs,
+            spike_multiplier: cfg.momentum.spike_multiplier,
+            min_short_volume_sol: cfg.momentum.min_short_volume_sol,
+            min_mcap_sol_to_fire: cfg.momentum.min_mcap_sol_to_fire,
+            min_mcap_rise_pct: cfg.momentum.min_mcap_rise_pct,
+            sweep_interval_ms: cfg.momentum.sweep_interval_ms,
+            max_mints: cfg.momentum.max_mints,
+        };
+        let (_det, rx) = MomentumDetector::spawn(mcfg, cfg.rpc.pumpportal_ws.clone());
+        info!(
+            min_age_secs=cfg.momentum.min_age_secs,
+            spike_multiplier=cfg.momentum.spike_multiplier,
+            min_short_volume_sol=cfg.momentum.min_short_volume_sol,
+            min_mcap_sol_to_fire=cfg.momentum.min_mcap_sol_to_fire,
+            min_mcap_rise_pct=cfg.momentum.min_mcap_rise_pct,
+            max_mints=cfg.momentum.max_mints,
+            "📈 momentum_detector ENABLED"
+        );
+        Some(rx)
+    } else { None };
+
     let (mcap_watcher, mut band_crossing_rx): (Option<McapWatcher>, Option<tokio::sync::mpsc::Receiver<BandCrossing>>) = if cfg.mcap_watcher.enabled {
         let wcfg = WatcherCfg {
             min_mcap_usd: cfg.filters.min_market_cap_usd,
@@ -602,6 +630,59 @@ Wallet `{}`  cap `{} SOL`",
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // 2026-05-14: Spawn a background task to receive `MomentumSignal`
+    // events and route them through `handle_new_token`. Same filter
+    // chain runs — only the trigger differs.
+    if let Some(mut rx) = momentum_rx.take() {
+        let cfg_m = cfg.clone(); let db_m = db.clone(); let state_m = state.clone();
+        let tg_m = tg.clone(); let jup_m = jup.clone(); let curves_m = curves.clone();
+        let curve_sub_m = curve_sub.clone();
+        let symbol_cache_m = symbol_cache.clone();
+        let executor_m = executor.clone();
+        let dev_watcher_m = dev_watcher.clone();
+        let mcap_watcher_m = mcap_watcher.clone();
+        tokio::spawn(async move {
+            while let Some(sig) = rx.recv().await {
+                info!(
+                    mint=%sig.mint, symbol=%sig.symbol, mcap_sol=sig.mcap_sol,
+                    short_vol=sig.short_volume_sol, long_vol=sig.long_volume_sol,
+                    rise_pct=sig.mcap_rise_pct,
+                    "📨 momentum signal — routing to entry path"
+                );
+                let tok = pumpportal::NewToken {
+                    mint: sig.mint.clone(),
+                    name: sig.symbol.clone(),
+                    symbol: sig.symbol.clone(),
+                    mcap_sol: Some(sig.mcap_sol),
+                    v_sol: Some(sig.v_sol),
+                    v_tokens: Some(sig.v_tokens),
+                    initial_buy: None,
+                    trader: sig.trader.clone(),
+                    is_mayhem_mode: sig.is_mayhem_mode,
+                    received_at_ms: sig.detected_at_ms,
+                };
+                let cfg = cfg_m.clone(); let db = db_m.clone(); let state = state_m.clone();
+                let tg = tg_m.clone(); let jup = jup_m.clone(); let curves = curves_m.clone();
+                let curve_sub = curve_sub_m.clone();
+                let symbol_cache = symbol_cache_m.clone();
+                let executor = executor_m.clone();
+                let dev_watcher_clone = dev_watcher_m.clone();
+                let mcap_watcher_clone = mcap_watcher_m.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_new_token(
+                        &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
+                        &symbol_cache, executor.as_ref(),
+                        dev_watcher_clone.as_ref(),
+                        mcap_watcher_clone.as_ref(),
+                        tok,
+                    ).await {
+                        warn!(error=?e, "handle_new_token (momentum route) failed");
+                    }
+                });
             }
         });
     }

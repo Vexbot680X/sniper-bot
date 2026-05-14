@@ -18,6 +18,9 @@ pub struct Config {
     /// Mcap-progression watcher (2026-05-14). See `McapWatcher`.
     #[serde(default)]
     pub mcap_watcher: McapWatcher,
+    /// Momentum detector (2026-05-14). See `Momentum`.
+    #[serde(default)]
+    pub momentum: Momentum,
 }
 
 /// Jito Block Engine integration. When `enabled = true`, every live tx is
@@ -412,6 +415,45 @@ pub struct McapWatcher {
 
 fn default_mcap_watcher_ttl() -> u64 { 1800 }
 fn default_mcap_watcher_cap() -> usize { 2000 }
+
+/// Momentum detector (2026-05-14). When enabled, the bot opens a SECOND
+/// WS to PumpPortal that subscribes to all new tokens and then incrementally
+/// subscribes to trade events on every mint it sees. Rolling 6-minute volume
+/// buckets per mint are scored each second; spikes (short-window volume >>
+/// long-window baseline AND mcap rising) emit a MomentumSignal that gets
+/// routed through handle_new_token like any other entry candidate.
+///
+/// Designed for "older coin pops off" — NOT for fresh launches.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Momentum {
+    #[serde(default)] pub enabled: bool,
+    /// Skip mints younger than this. Default 300 = 5 min.
+    #[serde(default = "default_momentum_min_age")]
+    pub min_age_secs: i64,
+    /// short-window vol-per-sec / long-window vol-per-sec must exceed this.
+    #[serde(default = "default_momentum_multiplier")]
+    pub spike_multiplier: f64,
+    /// Absolute SOL volume floor in the short window before we consider.
+    #[serde(default = "default_momentum_min_short_sol")]
+    pub min_short_volume_sol: f64,
+    /// Required mcap floor (in SOL) at fire time.
+    #[serde(default = "default_momentum_min_mcap_sol")]
+    pub min_mcap_sol_to_fire: f64,
+    /// Required mcap rise (%) over the short window vs prior buckets.
+    #[serde(default = "default_momentum_min_rise")]
+    pub min_mcap_rise_pct: f64,
+    #[serde(default = "default_momentum_sweep_ms")]
+    pub sweep_interval_ms: u64,
+    #[serde(default = "default_momentum_max_mints")]
+    pub max_mints: usize,
+}
+fn default_momentum_min_age() -> i64 { 300 }
+fn default_momentum_multiplier() -> f64 { 5.0 }
+fn default_momentum_min_short_sol() -> f64 { 1.0 }
+fn default_momentum_min_mcap_sol() -> f64 { 100.0 }
+fn default_momentum_min_rise() -> f64 { 10.0 }
+fn default_momentum_sweep_ms() -> u64 { 1000 }
+fn default_momentum_max_mints() -> usize { 5000 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rpc {
