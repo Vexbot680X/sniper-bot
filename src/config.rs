@@ -311,6 +311,24 @@ pub struct Trading {
     /// Default TRUE — must be explicitly disabled to enable auto-exit.
     #[serde(default = "default_rug_watcher_alert_only")]
     pub rug_watcher_alert_only: bool,
+
+    /// LEARNING (Phase 4): dev-reputation entry gate.
+    /// When TRUE, before entering a position we look up the dev pubkey in the
+    /// `dev_reputation` cache. If the cached score is <= `dev_reputation_refuse_below`,
+    /// the entry is refused with reason "dev_reputation_too_low".
+    /// Unknown devs (no cached row, or trades_count < MIN_TRADES_FOR_SCORE)
+    /// are always allowed through — the gate only blocks proven-bad devs.
+    /// Default FALSE: we want to collect data first, see the scores accumulate,
+    /// and verify they predict outcomes before letting them block trades.
+    #[serde(default = "default_dev_reputation_enabled")]
+    pub dev_reputation_enabled: bool,
+
+    /// LEARNING (Phase 4): score threshold for refusal. A score of -1.0 is the
+    /// hard rug-fatal floor; -0.3 is the recommended starting threshold (refuse
+    /// only clearly-bad devs). Range [-1.0, +1.0]. Ignored when
+    /// `dev_reputation_enabled` is false. Default -0.3.
+    #[serde(default = "default_dev_reputation_refuse_below")]
+    pub dev_reputation_refuse_below: f64,
 }
 
 fn default_slippage_bps() -> u16 { 200 }
@@ -331,6 +349,8 @@ fn default_dev_vetting_required() -> bool { true }
 fn default_dev_vetting_max_launches() -> u32 { 3 }
 fn default_rug_watcher_enabled() -> bool { true }
 fn default_rug_watcher_alert_only() -> bool { true }
+fn default_dev_reputation_enabled() -> bool { false }
+fn default_dev_reputation_refuse_below() -> f64 { -0.3 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scanner {

@@ -30,6 +30,11 @@ pub struct TradeRecord {
     pub exit_sig: Option<String>,
     /// Total fees paid in lamports (network + priority). 0 for paper.
     pub fees_lamports: i64,
+    /// LEARNING (Phase 4): dev wallet that launched this token.
+    /// Same value as Position.dev_pubkey. None when unknown (very old paper
+    /// trades, or live trades where resolution failed). Denormalized onto
+    /// the trade row so the dev-reputation scorer doesn't need to join.
+    pub dev_pubkey: Option<String>,
 }
 
 /// Every live buy attempt — success OR failure — lands here so we can audit
@@ -137,6 +142,27 @@ impl Db {
                 added_at   TEXT NOT NULL,
                 reason     TEXT
             );
+
+            -- LEARNING (Phase 4): rolling per-dev reputation cache.
+            -- Recomputed from trades table on each close via
+            -- recompute_dev_reputation(); read in handle_new_token() to gate
+            -- entry. We cache the aggregate so the hot path is a single
+            -- indexed PK lookup rather than a GROUP BY over all trades.
+            -- score is a number in [-1.0, +1.0]; see `compute_dev_score` for
+            -- the formula. NULL score means "insufficient data, treat neutral".
+            CREATE TABLE IF NOT EXISTS dev_reputation (
+                dev_pubkey    TEXT PRIMARY KEY,
+                trades_count  INTEGER NOT NULL,
+                wins          INTEGER NOT NULL,
+                losses        INTEGER NOT NULL,
+                total_pnl_usd REAL    NOT NULL,
+                avg_pnl_pct   REAL    NOT NULL,
+                rug_exits     INTEGER NOT NULL,
+                last_trade_at TEXT    NOT NULL,
+                score         REAL,
+                updated_at    TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dev_reputation_score ON dev_reputation(score);
             "#,
         )?;
 
@@ -147,6 +173,13 @@ impl Db {
             "ALTER TABLE trades ADD COLUMN entry_sig TEXT",
             "ALTER TABLE trades ADD COLUMN exit_sig TEXT",
             "ALTER TABLE trades ADD COLUMN fees_lamports INTEGER NOT NULL DEFAULT 0",
+            // Phase 4 (Learning): dev_pubkey denormalized onto trades for the
+            // reputation scorer. Idempotent ALTER for pre-existing DBs.
+            "ALTER TABLE trades ADD COLUMN dev_pubkey TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_trades_dev_pubkey ON trades(dev_pubkey)",
+            // Phase 4 (Learning): dev_reputation cache table for pre-existing DBs.
+            "CREATE TABLE IF NOT EXISTS dev_reputation (dev_pubkey TEXT PRIMARY KEY, trades_count INTEGER NOT NULL, wins INTEGER NOT NULL, losses INTEGER NOT NULL, total_pnl_usd REAL NOT NULL, avg_pnl_pct REAL NOT NULL, rug_exits INTEGER NOT NULL, last_trade_at TEXT NOT NULL, score REAL, updated_at TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_dev_reputation_score ON dev_reputation(score)",
             // Phase 3.Feature.3: dev_deployments table (added in CREATE block above
             // for fresh installs; this migration creates it on pre-existing DBs).
             "CREATE TABLE IF NOT EXISTS dev_deployments (dev_pubkey TEXT NOT NULL, mint TEXT NOT NULL, seen_at TEXT NOT NULL, UNIQUE(dev_pubkey, mint))",
@@ -166,14 +199,15 @@ impl Db {
             "INSERT OR REPLACE INTO trades
              (id, mint, symbol, entered_at, exited_at, entry_price, exit_price,
               size_usd, pnl_usd, pnl_pct, exit_reason, hold_seconds,
-              mode, entry_sig, exit_sig, fees_lamports)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              mode, entry_sig, exit_sig, fees_lamports, dev_pubkey)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 t.id, t.mint, t.symbol,
                 t.entered_at.to_rfc3339(), t.exited_at.to_rfc3339(),
                 t.entry_price, t.exit_price, t.size_usd,
                 t.pnl_usd, t.pnl_pct, t.exit_reason, t.hold_seconds,
-                t.mode, t.entry_sig, t.exit_sig, t.fees_lamports
+                t.mode, t.entry_sig, t.exit_sig, t.fees_lamports,
+                t.dev_pubkey,
             ],
         )?;
         Ok(())
@@ -267,6 +301,214 @@ impl Db {
         )?;
         Ok(n > 0)
     }
+
+    // ---------------------------------------------------------------
+    // LEARNING (Phase 4): dev reputation
+    // ---------------------------------------------------------------
+    //
+    // The plan:
+    //   - On every trade close we recompute the dev's aggregate row from
+    //     the trades table (cheap; trades per dev is tiny).
+    //   - Score is in [-1.0, +1.0]:
+    //       * < 3 trades -> NULL (treated as "unknown / neutral" by callers)
+    //       * rug_exits / trades >= 0.5 AND trades >= 2 -> -1.0 hard floor
+    //       * else: shifted Wilson lower bound on win rate, modulated by
+    //         average PnL%. See `compute_dev_score` for the math.
+    //   - Entry gate (default OFF) refuses when score <= threshold.
+    //
+    // The thresholds are tunable via config; the formula is fixed code so
+    // we don't accidentally fit it to noise mid-session.
+
+    /// Cached reputation row. Read by `dev_reputation_score` for the entry
+    /// gate, and by the operator-side learning skill for nightly review.
+    pub fn get_dev_reputation(&self, dev_pubkey: &str) -> Result<Option<DevReputation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT dev_pubkey, trades_count, wins, losses, total_pnl_usd, avg_pnl_pct,
+                    rug_exits, last_trade_at, score, updated_at
+             FROM dev_reputation WHERE dev_pubkey = ?1",
+        )?;
+        let row = stmt.query_row(params![dev_pubkey], |r| {
+            Ok(DevReputation {
+                dev_pubkey: r.get(0)?,
+                trades_count: r.get::<_, i64>(1)? as u32,
+                wins: r.get::<_, i64>(2)? as u32,
+                losses: r.get::<_, i64>(3)? as u32,
+                total_pnl_usd: r.get(4)?,
+                avg_pnl_pct: r.get(5)?,
+                rug_exits: r.get::<_, i64>(6)? as u32,
+                last_trade_at: r.get(7)?,
+                score: r.get(8)?,
+                updated_at: r.get(9)?,
+            })
+        });
+        match row {
+            Ok(rep) => Ok(Some(rep)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Convenience: returns just the cached score, or None for unknown devs.
+    /// Called from the hot entry path; one indexed PK lookup.
+    pub fn dev_reputation_score(&self, dev_pubkey: &str) -> Result<Option<f64>> {
+        Ok(self.get_dev_reputation(dev_pubkey)?.and_then(|r| r.score))
+    }
+
+    /// Recompute the aggregate row for `dev_pubkey` from the trades table
+    /// and UPSERT it into dev_reputation. Call after every trade close.
+    ///
+    /// We aggregate across BOTH paper and live trades on purpose: a dev's
+    /// rug behavior shows up in paper just as cleanly as in live, and we
+    /// want as much signal as possible. If we later decide paper is
+    /// misleading we can switch this to `mode = 'live'`.
+    pub fn recompute_dev_reputation(&self, dev_pubkey: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(pnl_usd), 0.0),
+                COALESCE(AVG(pnl_pct), 0.0),
+                COALESCE(SUM(CASE WHEN exit_reason LIKE 'rug%' OR exit_reason LIKE 'dev_%' OR exit_reason = 'rug_watcher' THEN 1 ELSE 0 END), 0),
+                MAX(exited_at)
+             FROM trades WHERE dev_pubkey = ?1",
+        )?;
+        let (trades_count, wins, losses, total_pnl_usd, avg_pnl_pct, rug_exits, last_trade_at): (
+            i64, i64, i64, f64, f64, i64, Option<String>,
+        ) = stmt.query_row(params![dev_pubkey], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })?;
+        // No trades for this dev — nothing to cache. Also covers the row-with-all-NULLs
+        // case after a SELECT with COUNT(*) = 0 on aggregate-only queries.
+        let Some(last) = last_trade_at else { return Ok(()); };
+        if trades_count == 0 { return Ok(()); }
+
+        let score = compute_dev_score(trades_count as u32, wins as u32, rug_exits as u32, avg_pnl_pct);
+        conn.execute(
+            "INSERT INTO dev_reputation
+             (dev_pubkey, trades_count, wins, losses, total_pnl_usd, avg_pnl_pct,
+              rug_exits, last_trade_at, score, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(dev_pubkey) DO UPDATE SET
+                trades_count  = excluded.trades_count,
+                wins          = excluded.wins,
+                losses        = excluded.losses,
+                total_pnl_usd = excluded.total_pnl_usd,
+                avg_pnl_pct   = excluded.avg_pnl_pct,
+                rug_exits     = excluded.rug_exits,
+                last_trade_at = excluded.last_trade_at,
+                score         = excluded.score,
+                updated_at    = excluded.updated_at",
+            params![
+                dev_pubkey, trades_count, wins, losses, total_pnl_usd, avg_pnl_pct,
+                rug_exits, last, score, Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Top N devs ordered by score DESC (NULLs last). Used by the learning
+    /// skill to surface candidates for blacklist / whitelist / boost.
+    pub fn list_dev_reputations(&self, limit: u32) -> Result<Vec<DevReputation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT dev_pubkey, trades_count, wins, losses, total_pnl_usd, avg_pnl_pct,
+                    rug_exits, last_trade_at, score, updated_at
+             FROM dev_reputation
+             ORDER BY (score IS NULL), score DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(DevReputation {
+                dev_pubkey: r.get(0)?,
+                trades_count: r.get::<_, i64>(1)? as u32,
+                wins: r.get::<_, i64>(2)? as u32,
+                losses: r.get::<_, i64>(3)? as u32,
+                total_pnl_usd: r.get(4)?,
+                avg_pnl_pct: r.get(5)?,
+                rug_exits: r.get::<_, i64>(6)? as u32,
+                last_trade_at: r.get(7)?,
+                score: r.get(8)?,
+                updated_at: r.get(9)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+}
+
+/// LEARNING (Phase 4): per-dev cached reputation row.
+#[derive(Debug, Clone)]
+pub struct DevReputation {
+    pub dev_pubkey: String,
+    pub trades_count: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub total_pnl_usd: f64,
+    pub avg_pnl_pct: f64,
+    pub rug_exits: u32,
+    pub last_trade_at: String,
+    /// None when trades_count < MIN_TRADES_FOR_SCORE.
+    pub score: Option<f64>,
+    pub updated_at: String,
+}
+
+/// Minimum trades before we publish a non-null score. Below this we treat the
+/// dev as "unknown/neutral" and never block on reputation alone.
+pub const MIN_TRADES_FOR_SCORE: u32 = 3;
+
+/// Hard-floor threshold: if rug_exits / trades_count is at or above this AND
+/// we have at least 2 trades, the score collapses to -1.0 ("never again").
+const RUG_FRACTION_FATAL: f64 = 0.5;
+const MIN_TRADES_FOR_RUG_FATAL: u32 = 2;
+
+/// Compute a dev's reputation score from raw aggregates.
+///
+/// Returns:
+///   - `None` if trades_count < MIN_TRADES_FOR_SCORE (insufficient data).
+///   - `Some(-1.0)` if rug fraction >= RUG_FRACTION_FATAL with >= 2 trades.
+///   - `Some(x)` in [-1.0, +1.0] otherwise.
+///
+/// Formula (when neither short-circuit fires):
+///   wilson_lb_95 = Wilson 95% lower bound on win-rate p
+///   wr_component = (wilson_lb_95 - 0.5) * 2   # in [-1, +1]
+///   pnl_modifier = clamp(avg_pnl_pct / 100, -1.0, 2.0)   # avg % return
+///   score        = clamp(wr_component * (1.0 + pnl_modifier), -1.0, 1.0)
+///
+/// The Wilson lower bound penalizes small sample sizes: a 100% win rate over
+/// 3 trades scores lower than 60% over 30 trades. The PnL modifier lets a
+/// dev with rare but huge winners outscore one with frequent small wins.
+///
+/// Pure function, no I/O, so it's trivially unit-testable.
+pub fn compute_dev_score(
+    trades_count: u32,
+    wins: u32,
+    rug_exits: u32,
+    avg_pnl_pct: f64,
+) -> Option<f64> {
+    if trades_count < MIN_TRADES_FOR_SCORE {
+        return None;
+    }
+    if trades_count >= MIN_TRADES_FOR_RUG_FATAL {
+        let rug_frac = rug_exits as f64 / trades_count as f64;
+        if rug_frac >= RUG_FRACTION_FATAL {
+            return Some(-1.0);
+        }
+    }
+    let n = trades_count as f64;
+    let p = (wins as f64) / n;
+    // Wilson 95% lower bound (z = 1.96).
+    let z: f64 = 1.96;
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let center = p + z2 / (2.0 * n);
+    let margin = z * ((p * (1.0 - p) / n) + (z2 / (4.0 * n * n))).sqrt();
+    let wilson_lb = (center - margin) / denom;
+    let wr_component = (wilson_lb - 0.5) * 2.0; // -1..+1 centred at WR=50%
+    let pnl_modifier = (avg_pnl_pct / 100.0).clamp(-1.0, 2.0);
+    let raw = wr_component * (1.0 + pnl_modifier);
+    Some(raw.clamp(-1.0, 1.0))
 }
 
 #[cfg(test)]
@@ -360,5 +602,161 @@ mod dev_vetting_tests {
         let db = db();
         let since = Utc::now() - chrono::Duration::hours(24);
         assert_eq!(db.count_dev_deployments_since("UNKNOWN", since).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod dev_reputation_tests {
+    use super::*;
+
+    fn db() -> Db { Db::open(":memory:").unwrap() }
+
+    fn rec(id: &str, dev: Option<&str>, pnl_usd: f64, pnl_pct: f64, reason: &str) -> TradeRecord {
+        TradeRecord {
+            id: id.to_string(),
+            mint: format!("MINT_{id}"),
+            symbol: "SYM".to_string(),
+            entered_at: Utc::now() - chrono::Duration::seconds(60),
+            exited_at: Utc::now(),
+            entry_price: 0.0001,
+            exit_price: 0.00015,
+            size_usd: 1.0,
+            pnl_usd,
+            pnl_pct,
+            exit_reason: reason.to_string(),
+            hold_seconds: 60,
+            mode: "paper".to_string(),
+            entry_sig: None,
+            exit_sig: None,
+            fees_lamports: 0,
+            dev_pubkey: dev.map(|s| s.to_string()),
+        }
+    }
+
+    // ---- compute_dev_score pure-function tests ----
+
+    #[test]
+    fn insufficient_trades_returns_none() {
+        assert!(compute_dev_score(0, 0, 0, 0.0).is_none());
+        assert!(compute_dev_score(1, 1, 0, 50.0).is_none());
+        assert!(compute_dev_score(2, 2, 0, 50.0).is_none());
+    }
+
+    #[test]
+    fn three_wins_three_trades_is_positive_but_capped_by_wilson() {
+        // 3/3 wins, +20% avg: Wilson lower bound on p=1.0, n=3 is ~0.44.
+        // wr_component = (0.44 - 0.5) * 2 ≈ -0.12 (slightly NEGATIVE)
+        // pnl_modifier = 0.2; score = -0.12 * 1.2 ≈ -0.14
+        // This is intentional: 3-of-3 is not enough evidence to call a dev good.
+        let s = compute_dev_score(3, 3, 0, 20.0).unwrap();
+        assert!(s < 0.0, "3/3 should not be enough to score positive, got {s}");
+        assert!(s > -0.5, "but it shouldn't crater either, got {s}");
+    }
+
+    #[test]
+    fn many_wins_high_pnl_scores_strongly_positive() {
+        let s = compute_dev_score(30, 24, 0, 35.0).unwrap();
+        assert!(s > 0.3, "80% WR over 30 trades + +35% avg should score > 0.3, got {s}");
+        assert!(s <= 1.0);
+    }
+
+    #[test]
+    fn many_losses_scores_strongly_negative() {
+        let s = compute_dev_score(20, 4, 0, -25.0).unwrap();
+        assert!(s < -0.2, "20% WR + -25% avg should score < -0.2, got {s}");
+        assert!(s >= -1.0);
+    }
+
+    #[test]
+    fn half_or_more_rug_exits_is_fatal() {
+        // 4 trades, 2 rugs -> rug_frac = 0.5 -> hard floor -1.0
+        assert_eq!(compute_dev_score(4, 2, 2, 0.0), Some(-1.0));
+        // 6 trades, 3 rugs -> 0.5 -> fatal
+        assert_eq!(compute_dev_score(6, 3, 3, 50.0), Some(-1.0));
+        // 5 trades, 2 rugs -> 0.4 -> NOT fatal
+        assert_ne!(compute_dev_score(5, 5, 2, 50.0), Some(-1.0));
+    }
+
+    #[test]
+    fn score_is_always_clamped_to_minus1_plus1() {
+        for &(t, w, r, p) in &[
+            (50_u32, 50_u32, 0_u32, 500.0_f64),
+            (50, 0, 0, -500.0),
+            (10, 9, 0, 1000.0),
+        ] {
+            let s = compute_dev_score(t, w, r, p).unwrap();
+            assert!(s >= -1.0 && s <= 1.0, "score {s} out of range for ({t},{w},{r},{p})");
+        }
+    }
+
+    // ---- storage roundtrip tests ----
+
+    #[test]
+    fn unknown_dev_returns_none() {
+        let db = db();
+        assert!(db.get_dev_reputation("UNKNOWN_DEV").unwrap().is_none());
+        assert!(db.dev_reputation_score("UNKNOWN_DEV").unwrap().is_none());
+    }
+
+    #[test]
+    fn recompute_after_trades_caches_aggregate() {
+        let db = db();
+        let dev = "DEV_X";
+        // 4 trades: 3 wins, 1 loss, no rugs, ~+15% avg
+        db.record_trade(&rec("t1", Some(dev), 0.5, 20.0, "take_profit")).unwrap();
+        db.record_trade(&rec("t2", Some(dev), 0.6, 25.0, "take_profit")).unwrap();
+        db.record_trade(&rec("t3", Some(dev), 0.3, 15.0, "take_profit")).unwrap();
+        db.record_trade(&rec("t4", Some(dev), -0.2, 0.0, "stop_loss")).unwrap();
+        db.recompute_dev_reputation(dev).unwrap();
+        let rep = db.get_dev_reputation(dev).unwrap().expect("row exists");
+        assert_eq!(rep.trades_count, 4);
+        assert_eq!(rep.wins, 3);
+        assert_eq!(rep.losses, 1);
+        assert_eq!(rep.rug_exits, 0);
+        assert!((rep.total_pnl_usd - 1.2).abs() < 1e-9);
+        assert!(rep.score.is_some());
+    }
+
+    #[test]
+    fn rug_exit_reasons_are_counted() {
+        let db = db();
+        let dev = "DEV_RUGGY";
+        db.record_trade(&rec("r1", Some(dev), -0.8, -80.0, "rug_watcher")).unwrap();
+        db.record_trade(&rec("r2", Some(dev), -0.7, -70.0, "rug_dev_sold")).unwrap();
+        db.record_trade(&rec("r3", Some(dev), 0.3, 30.0, "take_profit")).unwrap();
+        db.recompute_dev_reputation(dev).unwrap();
+        let rep = db.get_dev_reputation(dev).unwrap().unwrap();
+        assert_eq!(rep.rug_exits, 2);
+        // 2/3 rugs >= 0.5 -> hard floor.
+        assert_eq!(rep.score, Some(-1.0));
+    }
+
+    #[test]
+    fn trades_without_dev_dont_affect_anyone() {
+        let db = db();
+        db.record_trade(&rec("a", None, 1.0, 50.0, "take_profit")).unwrap();
+        db.record_trade(&rec("b", None, -1.0, -50.0, "stop_loss")).unwrap();
+        // Recomputing for an unrelated dev is a no-op (no rows -> early return).
+        db.recompute_dev_reputation("SOME_DEV").unwrap();
+        assert!(db.get_dev_reputation("SOME_DEV").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_dev_reputations_orders_by_score_desc() {
+        let db = db();
+        // Good dev: many wins, no rugs
+        for i in 0..20 {
+            db.record_trade(&rec(&format!("g{i}"), Some("GOOD"), 0.5, 30.0, "take_profit")).unwrap();
+        }
+        db.recompute_dev_reputation("GOOD").unwrap();
+        // Bad dev: many losses
+        for i in 0..20 {
+            db.record_trade(&rec(&format!("b{i}"), Some("BAD"), -0.5, -40.0, "stop_loss")).unwrap();
+        }
+        db.recompute_dev_reputation("BAD").unwrap();
+        let top = db.list_dev_reputations(10).unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].dev_pubkey, "GOOD");
+        assert_eq!(top[1].dev_pubkey, "BAD");
     }
 }

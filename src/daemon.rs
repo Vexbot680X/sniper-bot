@@ -581,6 +581,45 @@ async fn handle_new_token(
         }
     }
 
+    // 🧠 LEARNING (Phase 4): dev-reputation entry gate.
+    // Default OFF (dev_reputation_enabled = false in default config). When
+    // enabled, we look up the dev's cached score (computed from the trades
+    // table on every close) and refuse entry if it's at-or-below the
+    // configured threshold. Unknown devs (no row, or trades_count < 3) are
+    // ALWAYS allowed — the gate only blocks dev wallets we've proven bad on.
+    // We ALWAYS log the score (even when disabled or unknown) so the
+    // learning skill can observe the would-be decisions.
+    if let Some(dev) = tok.trader.as_deref() {
+        if !dev.is_empty() {
+            match db.dev_reputation_score(dev) {
+                Ok(Some(score)) => {
+                    if cfg.trading.dev_reputation_enabled
+                        && score <= cfg.trading.dev_reputation_refuse_below
+                    {
+                        let reason = format!("dev_reputation_too_low {:.3} <= {:.3}", score, cfg.trading.dev_reputation_refuse_below);
+                        info!(
+                            mint=%tok.mint, dev=%dev,
+                            score=%format!("{:.3}", score),
+                            threshold=%format!("{:.3}", cfg.trading.dev_reputation_refuse_below),
+                            "❌ dev reputation too low — entry refused"
+                        );
+                        let _ = db.record_rejection(&tok.mint, &reason);
+                        return Ok(());
+                    } else {
+                        info!(
+                            mint=%tok.mint, dev=%dev,
+                            score=%format!("{:.3}", score),
+                            gate_enabled = cfg.trading.dev_reputation_enabled,
+                            "🧠 dev reputation observed"
+                        );
+                    }
+                }
+                Ok(None) => { /* unknown dev — silent, always allowed */ }
+                Err(e) => warn!(error=?e, dev=%dev, "dev reputation lookup failed; continuing"),
+            }
+        }
+    }
+
     // 🛡️ RACE FIX (2026-05-13): atomically reserve a concurrency slot.
     // PREVIOUSLY (BROKEN): two simultaneous tokio::spawn'd handlers both
     // locked state, both saw `open_positions.len() < max`, both released the

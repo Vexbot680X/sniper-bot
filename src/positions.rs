@@ -259,6 +259,7 @@ pub fn close_position_paper(
     let pnl_usd = exit_value - pos.size_usd;
     let pnl_pct = (pnl_usd / pos.size_usd) * 100.0;
     state.bankroll_usd += exit_value; // return capital + pnl
+    let dev_pubkey = pos.dev_pubkey.clone();
     update_stats_and_skim(state, pnl_usd, pnl_pct, reason, skim_pct, /*skim_lamports*/ 0)
         .map(|skimmed_usd| {
             let now = Utc::now();
@@ -279,8 +280,16 @@ pub fn close_position_paper(
                 entry_sig: None,
                 exit_sig: None,
                 fees_lamports,
+                dev_pubkey: dev_pubkey.clone(),
             };
             db.record_trade(&rec).ok();
+            // 🧠 LEARNING (Phase 4): refresh the dev's cached score after this close.
+            // Cheap (one GROUP BY over this dev's trades, typically a handful).
+            if let Some(d) = dev_pubkey.as_deref() {
+                if let Err(e) = db.recompute_dev_reputation(d) {
+                    tracing::warn!(error=?e, dev=%d, "dev_reputation recompute failed (paper close)");
+                }
+            }
             CloseResult { trade: rec, skimmed_usd, sell_signature: None, skim_signature: None }
         })
 }
@@ -401,8 +410,15 @@ pub async fn close_position_live(
         exit_sig: Some(exit_sig_str.clone()),
         // Fee accounting via on-chain getTransaction.meta.fee would go here; deferred.
         fees_lamports: 0,
+        dev_pubkey: pos.dev_pubkey.clone(),
     };
     db.record_trade(&rec)?;
+    // 🧠 LEARNING (Phase 4): refresh dev reputation cache for this dev.
+    if let Some(d) = pos.dev_pubkey.as_deref() {
+        if let Err(e) = db.recompute_dev_reputation(d) {
+            tracing::warn!(error=?e, dev=%d, "dev_reputation recompute failed (live close)");
+        }
+    }
     Ok(CloseResult {
         trade: rec,
         skimmed_usd,

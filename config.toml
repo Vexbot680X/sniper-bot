@@ -88,6 +88,18 @@ dev_vetting_max_launches_24h = 3
 rug_watcher_enabled = true
 rug_watcher_alert_only = false  # 🔑 LIVE 2026-05-12 15:37 — AUTO-EXIT enabled (THE KILLER FEATURE). After ASST rug trade caught at 170ms in alert-only mode, Mamba flipped this to auto-sell on dev dump.
 
+# 🧠 LEARNING (Phase 4): dev-reputation entry gate.
+# Every trade close updates a cached score per dev_pubkey in the dev_reputation
+# table (Wilson lower bound on win-rate, modulated by avg PnL%; hard floor at
+# -1.0 if rug exits >= 50% of trades). Range [-1.0, +1.0]; NULL when the dev
+# has fewer than 3 trades against us (treated as "unknown / always allowed").
+#
+# OBSERVE-ONLY by default: scores accumulate silently so we can verify they
+# predict outcomes BEFORE we let them block trades. Flip dev_reputation_enabled
+# to true once we have ~30+ scored devs and Mamba+Vex have reviewed the data.
+dev_reputation_enabled = false
+dev_reputation_refuse_below = -0.3  # range -1.0..+1.0; -0.3 = block proven-bad devs only
+
 [skim]
 # Continuous profit skim: on every winning close, move skim_pct of the realized
 # gain to a sidelined `vault_usd` balance. Vault is one-way — never withdrawn back
