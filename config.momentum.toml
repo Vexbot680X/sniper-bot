@@ -46,17 +46,17 @@ max_curve_age_ms = 1500
 # 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
 # to 0.005 per PHASE_3_PLAN.md — smaller positions = smaller fee drag relative
 # to rug-detection edge, AND smaller blast radius for any safety feature bug.
-position_size_sol = 0.05        # 🔵 MIDBAND 2026-05-14 16:55 (unified) — raised to 0.05 SOL ($4.57) per Mamba. At $15-25k mcap, curve depth ~$150-250 so 0.05 SOL = 2-3% of depth. Still within Rule #3 (<5%) but tighter than at 50k-band.
+position_size_sol = 0.02        # 🔋 CONSERVATIVE 2026-05-14 17:57 — dropped 0.05 → 0.02 SOL (~$1.83). Damage-control.
 position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
 
 # 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
 # The bot refuses any LIVE buy that would exceed this many SOL, regardless of
 # what position_size_sol or any other math says. Paper mode ignores this.
 # Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
-live_max_position_sol = 0.05    # 🔵 MIDBAND (unified) — hard cap matches position_size_sol.
+live_max_position_sol = 0.02    # 🔋 CONSERVATIVE 2026-05-14 17:57 — hard cap matches position_size_sol.
 take_profit_pct = 25.0           # 🔵 MIDBAND 16:55 (unified) — +25% target. On 0.05 SOL ($4.57) → ~$1.14 gross / ~$1.04 net win.
 stop_loss_pct = 10.0             # 🔵 MIDBAND 16:55 (unified) — -10% stop. On 0.05 SOL → ~$0.46 max book loss + $0.09 fees = ~$0.55 per stopped trade.
-max_concurrent_positions = 2    # 📈 MOMENTUM 2026-05-14 17:10 — cap at 2. Combined with 50k (max 3) and midband (max 2): worst-case 7 concurrent x 0.05 = 0.35 SOL = ~$32 (95% wallet). Pulls back hard if all three bots are loaded simultaneously.
+max_concurrent_positions = 2    # 🔋 CONSERVATIVE 2026-05-14 17:57 — unchanged. Worst-case fleet: 6 × 0.02 = 0.12 SOL ($11 = 32% wallet).
 max_hold_seconds = 120          # 📈 MOMENTUM — 2-min hold. Pop-offs often last 1-3 minutes; longer than midband, shorter than 50k pre-grad.
 # Rug exit: if open position's mcap collapses below this, force-close.
 # USD-denominated takes precedence when > 0; bot converts to SOL at decision time.

@@ -46,17 +46,17 @@ max_curve_age_ms = 1500
 # 🔒 STRATEGY v5 (Phase 3, 2026-05-11): position_size_sol HALVED from v4's 0.01
 # to 0.005 per PHASE_3_PLAN.md — smaller positions = smaller fee drag relative
 # to rug-detection edge, AND smaller blast radius for any safety feature bug.
-position_size_sol = 0.05        # 🚨 AGGRESSIVE 2026-05-14 14:27 — Mamba elected to skip tier-gate. JUMP from 0.01 to 0.05 SOL (5x) at SAME $3.5-5k mcap band. WARNING: this is Rule #3 territory (~10% of curve depth, not <5%) and Rule #18 violation (14 trades not 20 at previous tier). Target: $1.80/trade requires +39% avg at this size. Today's avg is +19.6% at 0.01 SOL — edge will be eaten by slippage at this size. May 12 round 3 had identical setup (0.05 SOL @ $3.5-5k, killer feature on) → -$2.39 net over 9 trades. We're testing whether the new audit-trail/dev-rep filters change that outcome. Stop conditions: -3 trades in a row, or session loss >$5, or 20 trades completed.
+position_size_sol = 0.02        # 🔋 CONSERVATIVE 2026-05-14 17:57 — dropped 0.05 → 0.02 SOL (~$1.83). After momentum bot lost $15 in 12 min at 0.05, switch to small-size damage-control. Fees (~$0.09/trade) are now 5% drag, so need 5%+ winners just to break even.
 position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
 
 # 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
 # The bot refuses any LIVE buy that would exceed this many SOL, regardless of
 # what position_size_sol or any other math says. Paper mode ignores this.
 # Default = 0.01 (dust mode). Raise deliberately when scaling up live trading.
-live_max_position_sol = 0.05    # 🚨 AGGRESSIVE 2026-05-14 14:27 — hard cap matches position_size_sol. New confirm-phrase required.
+live_max_position_sol = 0.02    # 🔋 CONSERVATIVE 2026-05-14 17:57 — hard cap matches position_size_sol.
 take_profit_pct = 25.0           # 🔥 50-70K 2026-05-14 16:55 (unified) — lowered from +30 to +25 per Mamba unified spec. On 0.05 SOL → ~$1.14 gross / ~$1.04 net.
 stop_loss_pct = 10.0             # 🆕 50-70K 2026-05-14 — -10% stop. Tight enough to cap rug damage, loose enough not to whipsaw on normal pre-grad volatility.
-max_concurrent_positions = 3    # 🔥 FULL-SEND 2026-05-14 15:55 — RAISED from 1 to 3. Mamba asked for 10; capped at 3 because wallet ($33.78) can only fund 6 concurrent 0.05 SOL positions ($27.42) before insufficient-balance errors start. 3 leaves room for fees and slippage on each.
+max_concurrent_positions = 2    # 🔋 CONSERVATIVE 2026-05-14 17:57 — dropped 3 → 2. Combined fleet max: 6 × 0.02 = 0.12 SOL ($11 = 32% wallet).
 max_hold_seconds = 180          # 🆕 50-70K 2026-05-14 — 3-min hold. Pre-grad pumps need minutes; 20s was for $3-5k mcap micro-scalps.
 # Rug exit: if open position's mcap collapses below this, force-close.
 # USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
