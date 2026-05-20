@@ -619,6 +619,12 @@ impl Executor {
     /// initialized yet. Retry up to 5 times with exponential-ish backoff for
     /// `AccountNotInitialized` (Anchor 3012 / 0xbc4) and `BondingCurveNotFound`.
     pub async fn buy(&self, mint: &str, amount_sol: f64) -> Result<BuyFill> {
+        // 🛡️ WATCHDOG (2026-05-20): refuse new buys after a session-level
+        // circuit-breaker trip. The flag is process-wide and only clears on
+        // restart — intentional, operator review required.
+        if crate::watchdog::is_halted() {
+            anyhow::bail!("executor refused buy: watchdog HALT is set");
+        }
         let mint_pk = Pubkey::from_str(mint).context("parse mint")?;
         let amount_lamports = sol_to_lamports(amount_sol);
         let slippage_pct = ((self.slippage_bps as f64 / 100.0).round() as u32).max(1);

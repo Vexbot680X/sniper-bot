@@ -4003,6 +4003,7 @@ name = "sniper-bot"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bincode",
  "bs58",
  "chrono",

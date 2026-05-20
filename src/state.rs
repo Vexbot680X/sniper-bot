@@ -115,6 +115,16 @@ pub struct Position {
     /// sides.
     #[serde(default)]
     pub entry_fee_lamports: Option<i64>,
+
+    /// 🎯 COPY-TRADE V1 (2026-05-20): the target wallet whose buy signal
+    /// opened this position. None for non-copy-trade-sourced positions
+    /// (normal launches, mcap-watcher, momentum, livestream, trending).
+    /// Drives the `copy_trade_outcomes` table insert on close.
+    #[serde(default)]
+    pub copy_source_wallet: Option<String>,
+    /// Human-readable label of the source wallet (e.g. "Gake").
+    #[serde(default)]
+    pub copy_source_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -326,6 +336,8 @@ mod tests {
             curve_sol_at_entry: None,
             entry_sig: None,
             entry_fee_lamports: None,
+            copy_source_wallet: None,
+            copy_source_label: None,
         }
     }
 

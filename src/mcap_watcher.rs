@@ -317,6 +317,9 @@ mod tests {
             trader: Some(format!("dev_{sym}")),
             is_mayhem_mode: None,
             received_at_ms: 0,
+            skip_dev_vetting: false,
+            copy_source_wallet: None,
+            copy_source_label: None,
         }
     }
 

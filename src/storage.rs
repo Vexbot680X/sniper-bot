@@ -163,6 +163,28 @@ impl Db {
                 updated_at    TEXT    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_dev_reputation_score ON dev_reputation(score);
+
+            -- 🎯 COPY-TRADE V1 (2026-05-20). Per-position outcome row written on
+            -- every position close that originated from a copy-trade signal.
+            -- Drives the Phase 4 learning step that down-weights underperforming
+            -- target wallets. Lives alongside `trades`; the trades table covers
+            -- all positions, this one is the copy-trade-specific projection.
+            CREATE TABLE IF NOT EXISTS copy_trade_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opened_at INTEGER,
+                closed_at INTEGER,
+                source_wallet TEXT,
+                source_label TEXT,
+                mint TEXT,
+                entry_sol REAL,
+                exit_sol REAL,
+                pnl_pct REAL,
+                exit_reason TEXT,
+                hype_score_at_entry REAL,
+                hold_seconds INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_copy_trade_outcomes_source ON copy_trade_outcomes(source_wallet);
+            CREATE INDEX IF NOT EXISTS idx_copy_trade_outcomes_closed_at ON copy_trade_outcomes(closed_at);
             "#,
         )?;
 
@@ -185,6 +207,10 @@ impl Db {
             "CREATE TABLE IF NOT EXISTS dev_deployments (dev_pubkey TEXT NOT NULL, mint TEXT NOT NULL, seen_at TEXT NOT NULL, UNIQUE(dev_pubkey, mint))",
             "CREATE INDEX IF NOT EXISTS idx_dev_deployments_dev_seen ON dev_deployments(dev_pubkey, seen_at)",
             "CREATE TABLE IF NOT EXISTS dev_blacklist (dev_pubkey TEXT PRIMARY KEY, added_at TEXT NOT NULL, reason TEXT)",
+            // 🎯 COPY-TRADE V1 (2026-05-20): copy_trade_outcomes table for pre-existing DBs.
+            "CREATE TABLE IF NOT EXISTS copy_trade_outcomes (id INTEGER PRIMARY KEY AUTOINCREMENT, opened_at INTEGER, closed_at INTEGER, source_wallet TEXT, source_label TEXT, mint TEXT, entry_sol REAL, exit_sol REAL, pnl_pct REAL, exit_reason TEXT, hype_score_at_entry REAL, hold_seconds INTEGER)",
+            "CREATE INDEX IF NOT EXISTS idx_copy_trade_outcomes_source ON copy_trade_outcomes(source_wallet)",
+            "CREATE INDEX IF NOT EXISTS idx_copy_trade_outcomes_closed_at ON copy_trade_outcomes(closed_at)",
         ];
         for m in &migrations {
             let _ = conn_inner.execute(m, []);  // ignore "duplicate column" errors
@@ -231,6 +257,38 @@ impl Db {
                 a.slippage_bps as i64, a.priority_fee_micro_lamports.map(|v| v as i64),
                 a.creator_pubkey, a.bc_present as i64,
                 a.outcome, a.anchor_err, a.tx_sig, detail, a.trade_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 🎯 COPY-TRADE V1 (2026-05-20): insert one outcome row per closed
+    /// copy-trade-sourced position. Best-effort — callers ignore errors so
+    /// a sqlite hiccup never blocks the trade-close path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_copy_trade_outcome(
+        &self,
+        opened_at: i64,
+        closed_at: i64,
+        source_wallet: &str,
+        source_label: &str,
+        mint: &str,
+        entry_sol: f64,
+        exit_sol: f64,
+        pnl_pct: f64,
+        exit_reason: &str,
+        hype_score_at_entry: Option<f64>,
+        hold_seconds: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO copy_trade_outcomes
+             (opened_at, closed_at, source_wallet, source_label, mint,
+              entry_sol, exit_sol, pnl_pct, exit_reason, hype_score_at_entry, hold_seconds)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                opened_at, closed_at, source_wallet, source_label, mint,
+                entry_sol, exit_sol, pnl_pct, exit_reason, hype_score_at_entry, hold_seconds,
             ],
         )?;
         Ok(())

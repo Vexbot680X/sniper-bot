@@ -9,6 +9,32 @@ use chrono::{Duration, Utc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// 🎯 COPY-TRADE V1 (2026-05-20): write one `copy_trade_outcomes` row per
+/// closed copy-trade-sourced position. No-op if `copy_source_wallet` is None
+/// (non-copy-trade position) or the DB insert errors (logged at warn level).
+fn maybe_record_copy_trade_outcome(db: &Db, pos: &Position, rec: &TradeRecord, sol_usd: f64) {
+    let Some(source_wallet) = pos.copy_source_wallet.as_deref() else { return };
+    let source_label = pos.copy_source_label.as_deref().unwrap_or("unknown");
+    let entry_sol = if sol_usd > 0.0 { rec.size_usd / sol_usd } else { 0.0 };
+    let exit_sol = if sol_usd > 0.0 { (rec.size_usd + rec.pnl_usd) / sol_usd } else { 0.0 };
+    if let Err(e) = db.record_copy_trade_outcome(
+        rec.entered_at.timestamp(),
+        rec.exited_at.timestamp(),
+        source_wallet,
+        source_label,
+        &pos.mint,
+        entry_sol,
+        exit_sol,
+        rec.pnl_pct,
+        &rec.exit_reason,
+        None, // hype_score_at_entry — v1 observe-mode only, not persisted yet
+        rec.hold_seconds,
+    ) {
+        warn!(error=?e, mint=%pos.mint, source=%source_label,
+            "copy_trade_outcomes insert failed (non-fatal)");
+    }
+}
+
 pub struct ExitDecision {
     pub should_exit: bool,
     pub reason: String, // take_profit | stop_loss | timeout
@@ -110,6 +136,8 @@ pub fn open_position_paper(
         curve_sol_at_entry,
         entry_sig: None,            // paper mode — no on-chain entry
         entry_fee_lamports: None,   // paper mode — no on-chain fee
+        copy_source_wallet: None,   // set by handle_new_token after open() returns
+        copy_source_label: None,
     };
     state.bankroll_usd -= size_usd; // earmark
     state.open_positions.insert(mint, pos.clone());
@@ -178,6 +206,8 @@ pub async fn open_position_live(
         // basis. Failures are silently None — don't block the position open
         // on a meta lookup. fees_lamports on close will then = entry + exit.
         entry_fee_lamports: executor.fetch_tx_fee_lamports(&fill.signature).await.ok().flatten().map(|f| f as i64),
+        copy_source_wallet: None,   // set by handle_new_token after open_position_live returns
+        copy_source_label: None,
     };
 
     {
@@ -293,6 +323,10 @@ pub fn close_position_paper(
                 dev_pubkey: dev_pubkey.clone(),
             };
             db.record_trade(&rec).ok();
+            // 🎯 COPY-TRADE V1 (2026-05-20): if this position originated from a
+            // copy-trade BUY signal, write a row to copy_trade_outcomes for the
+            // Phase 4 learning loop.
+            maybe_record_copy_trade_outcome(db, &pos, &rec, sol_usd);
             // 🧠 LEARNING (Phase 4): refresh the dev's cached score after this close.
             // Cheap (one GROUP BY over this dev's trades, typically a handful).
             if let Some(d) = dev_pubkey.as_deref() {
@@ -431,6 +465,11 @@ pub async fn close_position_live(
         dev_pubkey: pos.dev_pubkey.clone(),
     };
     db.record_trade(&rec)?;
+    // 🎯 COPY-TRADE V1 (2026-05-20): if this position originated from a
+    // copy-trade BUY signal, write a row to copy_trade_outcomes for the
+    // Phase 4 learning loop. Live mode passes sol_usd which we use to
+    // convert USD sizes back to SOL for the outcome row.
+    maybe_record_copy_trade_outcome(db, &pos, &rec, sol_usd);
     // 🧠 LEARNING (Phase 4): refresh dev reputation cache for this dev.
     if let Some(d) = pos.dev_pubkey.as_deref() {
         if let Err(e) = db.recompute_dev_reputation(d) {
@@ -534,6 +573,8 @@ mod tests {
             curve_sol_at_entry: None,
             entry_sig: None,
             entry_fee_lamports: None,
+            copy_source_wallet: None,
+            copy_source_label: None,
         }
     }
 

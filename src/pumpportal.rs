@@ -29,6 +29,21 @@ pub struct NewToken {
     /// NewToken — the daemon falls back to "current time" in that case.
     #[serde(default)]
     pub received_at_ms: i64,
+    /// 🎯 COPY-TRADE V1 (2026-05-20): when true, skip the dev-vetting +
+    /// dev-reputation gates in handle_new_token. The signal here is "a
+    /// proven smart-money wallet just bought this", not "this dev has
+    /// good history". Defaults to false for normal launch / mcap-watcher /
+    /// momentum / livestream / trending routes.
+    #[serde(default)]
+    pub skip_dev_vetting: bool,
+    /// 🎯 COPY-TRADE V1 (2026-05-20): when this NewToken came from a copy-
+    /// trade BUY signal, the source wallet pubkey + label are carried through
+    /// so the resulting Position can persist them (drives the
+    /// `copy_trade_outcomes` table on close).
+    #[serde(default)]
+    pub copy_source_wallet: Option<String>,
+    #[serde(default)]
+    pub copy_source_label: Option<String>,
 }
 
 pub fn spawn_listener(ws_url: String) -> mpsc::Receiver<NewToken> {

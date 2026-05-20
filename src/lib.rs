@@ -3,16 +3,20 @@
 
 pub mod bonding_curve;
 pub mod config;
+pub mod copy_trader;
 pub mod dev_watcher;
 pub mod executor;
 pub mod jito;
 pub mod paper_slippage;
 pub mod pump_ix;
+pub mod pumpportal;
 pub mod pumpportal_trade;
 pub mod rpc;
 pub mod state;
 pub mod storage;
+pub mod telegram;
 pub mod wallet;
+pub mod watchdog;
 
 // `executor` references `crate::pump_ix`, `crate::rpc`, `crate::wallet`, `crate::config`
 // — already present above. It also references `crate::positions` indirectly via no

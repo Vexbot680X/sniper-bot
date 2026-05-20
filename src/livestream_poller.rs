@@ -298,6 +298,9 @@ pub fn to_new_token(sig: &LivestreamSignal) -> NewToken {
         trader: sig.creator.clone(),
         is_mayhem_mode: None,
         received_at_ms: sig.detected_at_ms,
+        skip_dev_vetting: false,
+        copy_source_wallet: None,
+        copy_source_label: None,
     }
 }
 

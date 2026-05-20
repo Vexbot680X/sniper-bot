@@ -2,6 +2,8 @@ use crate::bonding_curve::{CurveSubscriber, CurveTracker};
 use crate::mcap_watcher::{McapWatcher, WatcherCfg, JupiterSolUsd, BandCrossing};
 use crate::momentum_detector::{MomentumDetector, MomentumCfg, MomentumSignal};
 use crate::livestream_poller::{LivestreamPoller, LivestreamCfg, LivestreamSignal, to_new_token as livestream_to_new_token};
+use crate::copy_trader::{CopyTrader, CopyTraderCfg, to_new_token as copy_to_new_token};
+use crate::watchdog::Watchdog;
 use solana_sdk::signer::Signer;
 use crate::config::Config;
 use crate::executor::Executor;
@@ -735,6 +737,9 @@ Wallet `{}`  cap `{} SOL`",
                     trader: sig.trader.clone(),
                     is_mayhem_mode: sig.is_mayhem_mode,
                     received_at_ms: sig.detected_at_ms,
+                    skip_dev_vetting: false,
+                    copy_source_wallet: None,
+                    copy_source_label: None,
                 };
                 let cfg = cfg_m.clone(); let db = db_m.clone(); let state = state_m.clone();
                 let tg = tg_m.clone(); let jup = jup_m.clone(); let curves = curves_m.clone();
@@ -784,6 +789,9 @@ Wallet `{}`  cap `{} SOL`",
                     trader: ev.trader.clone(),
                     is_mayhem_mode: ev.is_mayhem_mode,
                     received_at_ms: ev.detected_at_ms,
+                    skip_dev_vetting: false,
+                    copy_source_wallet: None,
+                    copy_source_label: None,
                 };
                 let cfg = cfg_b.clone(); let db = db_b.clone(); let state = state_b.clone();
                 let tg = tg_b.clone(); let jup = jup_b.clone(); let curves = curves_b.clone();
@@ -806,6 +814,144 @@ Wallet `{}`  cap `{} SOL`",
             }
         });
     }
+
+    // 🛡️ WATCHDOG (2026-05-20): spawn the session-level circuit breaker.
+    // Hooks (register_executed_buy / register_realized_pnl) are called from
+    // handle_new_token (after a successful entry) and from the copy-sell path.
+    let watchdog: Watchdog = Watchdog::spawn(cfg.watchdog.clone(), tg.clone());
+
+    // 🎯 COPY-TRADER V1 (2026-05-20): if enabled, spawn one polling task per
+    // target wallet. Buy signals route through `handle_new_token` with
+    // `skip_dev_vetting=true`. Sell signals trigger forced-exit on any
+    // position we currently hold for the mint.
+    if let Some(copy_cfg) = CopyTraderCfg::from_config_and_env(&cfg.copy_trader) {
+        let target_count = copy_cfg.targets.len();
+        info!(target_count, poll_secs=copy_cfg.poll_interval_secs, min_copy_usd=copy_cfg.min_copy_usd,
+              "🎯 copy_trader ENABLED");
+        // Mask Helius key in startup banner. Format: c6dc...0f66.
+        let masked = {
+            let k = &copy_cfg.helius_api_key;
+            if k.len() <= 8 { "****".to_string() } else { format!("{}...{}", &k[..4], &k[k.len()-4..]) }
+        };
+        info!(helius_key=%masked, "🔑 copy_trader Helius key");
+        for t in &copy_cfg.targets {
+            info!(target=%t.pubkey, label=%t.label, weight=t.weight, "🎯 copy-trader target wallet");
+        }
+        let chans = CopyTrader::spawn(copy_cfg);
+        // Buy task: route to handle_new_token.
+        {
+            let mut buys_rx = chans.buys;
+            let cfg_c = cfg.clone(); let db_c = db.clone(); let state_c = state.clone();
+            let tg_c = tg.clone(); let jup_c = jup.clone(); let curves_c = curves.clone();
+            let curve_sub_c = curve_sub.clone();
+            let symbol_cache_c = symbol_cache.clone();
+            let executor_c = executor.clone();
+            let dev_watcher_c = dev_watcher.clone();
+            let mcap_watcher_c = mcap_watcher.clone();
+            tokio::spawn(async move {
+                while let Some(sig) = buys_rx.recv().await {
+                    info!(mint=%sig.mint, target=%sig.target_label, his_usd=sig.his_size_usd,
+                          "🎯 copy-trade BUY signal — routing to entry path");
+                    let tok = copy_to_new_token(&sig);
+                    let cfg = cfg_c.clone(); let db = db_c.clone(); let state = state_c.clone();
+                    let tg = tg_c.clone(); let jup = jup_c.clone(); let curves = curves_c.clone();
+                    let curve_sub = curve_sub_c.clone();
+                    let symbol_cache = symbol_cache_c.clone();
+                    let executor = executor_c.clone();
+                    let dev_watcher_clone = dev_watcher_c.clone();
+                    let mcap_watcher_clone = mcap_watcher_c.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_new_token(
+                            &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
+                            &symbol_cache, executor.as_ref(),
+                            dev_watcher_clone.as_ref(),
+                            mcap_watcher_clone.as_ref(),
+                            tok,
+                        ).await {
+                            warn!(error=?e, "handle_new_token (copy-trade route) failed");
+                        }
+                    });
+                }
+                warn!("copy_trader buy receiver closed — copy-trade route inactive for remainder of session");
+            });
+        }
+        // Sell task: force-close any position we hold for the mint.
+        {
+            let mut sells_rx = chans.sells;
+            let cfg_s = cfg.clone(); let db_s = db.clone(); let state_s = state.clone();
+            let tg_s = tg.clone(); let jup_s = jup.clone(); let curves_s = curves.clone();
+            let executor_s = executor.clone();
+            tokio::spawn(async move {
+                while let Some(sig) = sells_rx.recv().await {
+                    let holds_it = state_s.lock().await.open_positions.contains_key(&sig.mint);
+                    if !holds_it {
+                        debug!(mint=%sig.mint, target=%sig.target_label,
+                               "copy-trade SELL signal for mint we don't hold — no-op");
+                        continue;
+                    }
+                    info!(mint=%sig.mint, target=%sig.target_label,
+                          "🔴 copy-trade SELL signal — mirroring source exit");
+                    let _ = tg_s.send(&format!(
+                        "🔴 *COPY-SELL MIRROR* `{}`\nSource: `{}` dumped — closing our position.",
+                        sig.mint, sig.target_label
+                    )).await;
+                    let sol_usd = jup_s.sol_usd().await.unwrap_or(90.0);
+                    let current = match curves_s.get(&sig.mint).await {
+                        Some(c) => {
+                            let p = c.price_in_usd(sol_usd);
+                            if p > 0.0 && p.is_finite() { p } else { 0.0 }
+                        }
+                        None => 0.0,
+                    };
+                    let quoted_exit = if current > 0.0 { current } else {
+                        state_s.lock().await.open_positions.get(&sig.mint).map(|p| p.entry_price_usd).unwrap_or(0.0)
+                    };
+                    if let Some(ex) = executor_s.as_ref() {
+                        // Live: scale-out per config; close with reason=source_exit.
+                        {
+                            let mut s = state_s.lock().await;
+                            if s.live_selling.contains(&sig.mint) {
+                                warn!(mint=%sig.mint, "copy-sell: sell already in-flight, skipping");
+                                continue;
+                            }
+                            s.live_selling.insert(sig.mint.clone());
+                        }
+                        let scale_out = positions::ScaleOutOpts {
+                            enabled: cfg_s.trading.scale_out_enabled,
+                            tranches: cfg_s.trading.scale_out_tranches,
+                            delay_ms: cfg_s.trading.scale_out_delay_ms,
+                        };
+                        let r = positions::close_position_live(
+                            ex.as_ref(), &state_s, &db_s, &sig.mint, quoted_exit,
+                            "source_exit",
+                            cfg_s.skim.skim_pct, sol_usd, scale_out,
+                        ).await;
+                        { let mut s = state_s.lock().await; s.live_selling.remove(&sig.mint); }
+                        match r {
+                            Ok(cr) => info!(mint=%sig.mint, pnl_usd=cr.trade.pnl_usd,
+                                "✅ copy-sell mirror close ok"),
+                            Err(e) => error!(mint=%sig.mint, error=?e, "❌ copy-sell mirror close failed"),
+                        }
+                    } else {
+                        // Paper: close with same reason.
+                        let mut s = state_s.lock().await;
+                        let tranches = if cfg_s.trading.scale_out_enabled { cfg_s.trading.scale_out_tranches } else { 1 };
+                        let _ = positions::close_position_paper(
+                            &mut s, &db_s, &sig.mint, quoted_exit, "source_exit",
+                            cfg_s.skim.skim_pct,
+                            cfg_s.trading.position_size_sol, sol_usd, tranches,
+                            cfg_s.paper.slippage_enabled,
+                        );
+                    }
+                }
+                warn!("copy_trader sell receiver closed — copy-sell route inactive for remainder of session");
+            });
+        }
+    } else {
+        debug!("copy_trader disabled or misconfigured — copy-trade route not spawned");
+    }
+    // Suppress "unused" warnings until watchdog hooks are wired in callbacks.
+    let _ = &watchdog;
 
     info!("listening for new pump.fun launches");
     while let Some(tok) = new_tokens.recv().await {
@@ -864,7 +1010,12 @@ async fn handle_new_token(
     // mcap/age math. Blacklist hits are an immediate refuse; serial-rugger
     // detection looks at how many distinct mints this dev has launched in
     // the last 24h. Threshold is configurable (default 3).
-    if cfg.trading.dev_vetting_required {
+    //
+    // 🎯 COPY-TRADE V1 (2026-05-20): copy-trade-sourced events set
+    // `skip_dev_vetting=true` because the signal is "a proven smart-money
+    // wallet bought this", not "this dev has good history". Bypass both
+    // dev_vetting AND dev_reputation gates for those events.
+    if cfg.trading.dev_vetting_required && !tok.skip_dev_vetting {
         if let Some(dev) = tok.trader.as_deref() {
             if !dev.is_empty() {
                 // Manual blacklist check
@@ -906,7 +1057,10 @@ async fn handle_new_token(
     // ALWAYS allowed — the gate only blocks dev wallets we've proven bad on.
     // We ALWAYS log the score (even when disabled or unknown) so the
     // learning skill can observe the would-be decisions.
-    if let Some(dev) = tok.trader.as_deref() {
+    // 🎯 COPY-TRADE V1: same bypass policy as dev_vetting — we trust the
+    // smart-money signal over the dev's history.
+    if !tok.skip_dev_vetting {
+      if let Some(dev) = tok.trader.as_deref() {
         if !dev.is_empty() {
             match db.dev_reputation_score(dev) {
                 Ok(Some(score)) => {
@@ -935,6 +1089,7 @@ async fn handle_new_token(
                 Err(e) => warn!(error=?e, dev=%dev, "dev reputation lookup failed; continuing"),
             }
         }
+      }
     }
 
     // 🛡️ RACE FIX (2026-05-13): atomically reserve a concurrency slot.
@@ -1286,6 +1441,14 @@ async fn handle_new_token(
     {
         let mut s = state.lock().await;
         s.release_entry_reservation(&tok.mint);
+        // 🎯 COPY-TRADE V1 (2026-05-20): stamp copy-trade source on the
+        // inserted Position so the close path can write copy_trade_outcomes.
+        if tok.copy_source_wallet.is_some() {
+            if let Some(p) = s.open_positions.get_mut(&tok.mint) {
+                p.copy_source_wallet = tok.copy_source_wallet.clone();
+                p.copy_source_label = tok.copy_source_label.clone();
+            }
+        }
         let _ = s.save(&cfg.storage.state_path);
     }
     info!(mint=%pos.mint, symbol=%pos.symbol, entry=pos.entry_price_usd, size=pos.size_usd, mode=%cfg.trading.mode, "🎯 entered position");
