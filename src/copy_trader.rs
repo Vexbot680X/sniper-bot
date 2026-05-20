@@ -46,9 +46,67 @@ use crate::pumpportal::NewToken;
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn, error};
+
+/// Live SOL/USD provider. Implemented by `crate::jupiter::Jupiter` via a thin
+/// adapter; tests use a stub. Returns 0.0 on failure so callers can fall back.
+#[async_trait::async_trait]
+pub trait CopySolUsd: Send + Sync {
+    async fn sol_usd(&self) -> f64;
+}
+
+// NOTE: a `Jupiter`-backed adapter lives in `main.rs` (binary-only) because
+// `mod jupiter` is not in `lib.rs`. The lib exposes the `CopySolUsd` trait
+// and the daemon wires up the impl. Tests use a stub.
+
+/// Fallback when no provider is configured or all live lookups fail.
+const SOL_USD_FALLBACK: f64 = 90.0;
+
+/// Lightweight cached SOL/USD lookup. Fetches via the provider at most
+/// every 30s; caches between calls. Falls back to `SOL_USD_FALLBACK` if
+/// the provider returns 0.0 / errors / is `None`.
+struct SolUsdCache {
+    provider: Option<Arc<dyn CopySolUsd>>,
+    cached_micro_usd_per_sol: AtomicU64, // sol_usd * 1_000_000, integer for atomic store
+    last_fetch: Mutex<Option<Instant>>,
+    ttl: Duration,
+}
+
+impl SolUsdCache {
+    fn new(provider: Option<Arc<dyn CopySolUsd>>) -> Self {
+        Self {
+            provider,
+            cached_micro_usd_per_sol: AtomicU64::new((SOL_USD_FALLBACK * 1_000_000.0) as u64),
+            last_fetch: Mutex::new(None),
+            ttl: Duration::from_secs(30),
+        }
+    }
+    async fn get(&self) -> f64 {
+        let need_refresh = {
+            let last = self.last_fetch.lock().await;
+            match *last {
+                None => true,
+                Some(t) => t.elapsed() >= self.ttl,
+            }
+        };
+        if need_refresh {
+            if let Some(p) = self.provider.as_ref() {
+                let px = p.sol_usd().await;
+                if px > 0.0 && px.is_finite() {
+                    self.cached_micro_usd_per_sol
+                        .store((px * 1_000_000.0) as u64, Ordering::Relaxed);
+                }
+            }
+            let mut last = self.last_fetch.lock().await;
+            *last = Some(Instant::now());
+        }
+        let micros = self.cached_micro_usd_per_sol.load(Ordering::Relaxed);
+        (micros as f64) / 1_000_000.0
+    }
+}
 
 /// Tuning knobs. Loaded from `[copy_trader]` config section.
 #[derive(Debug, Clone)]
@@ -178,11 +236,31 @@ struct HeliusTx {
     #[serde(default, rename = "type")]
     tx_type: String,
     #[serde(default)]
+    #[allow(dead_code)]
     source: String,
+    #[serde(default)]
+    fee: u64,
+    #[serde(default, rename = "feePayer")]
+    fee_payer: String,
     #[serde(default)]
     events: Events,
     #[serde(default, rename = "tokenTransfers")]
     token_transfers: Vec<TokenTransfer>,
+    #[serde(default, rename = "accountData")]
+    account_data: Vec<AccountData>,
+}
+
+/// Per-account balance deltas. `nativeBalanceChange` is the CANONICAL signed
+/// SOL flow (in lamports) for a given account: negative = paid out, positive
+/// = received. This is the only field that gives us the real swap size for
+/// Jupiter-routed pump.fun trades — `events.swap.nativeInput/Output` only
+/// reflects the wSOL ATA top-up amount and is essentially noise.
+#[derive(Debug, Default, Deserialize)]
+struct AccountData {
+    #[serde(default)]
+    account: String,
+    #[serde(default, rename = "nativeBalanceChange")]
+    native_balance_change: i64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,6 +326,17 @@ pub struct CopyTrader {
     seen: Arc<Mutex<DedupRing>>,
 }
 
+/// Compute the target wallet's signed SOL delta (in lamports) for this tx.
+/// Returns 0 if the target isn't in `accountData` (shouldn't happen for txs
+/// returned by the per-address endpoint, but we guard anyway).
+fn target_native_delta(tx: &HeliusTx, target_pk: &str) -> i64 {
+    tx.account_data
+        .iter()
+        .find(|a| a.account == target_pk)
+        .map(|a| a.native_balance_change)
+        .unwrap_or(0)
+}
+
 struct DedupRing {
     cap: usize,
     set: HashSet<String>,
@@ -278,23 +367,29 @@ impl CopyTrader {
     /// Spawn one polling task per target wallet. Returns paired channels:
     /// buys (entry path) + sells (forced-exit path). Both detectors run from
     /// the same Helius fetch — no double API calls.
-    pub fn spawn(cfg: CopyTraderCfg) -> CopyChannels {
+    ///
+    /// `sol_usd_provider` is optional — if `None`, all sizes use the $90
+    /// fallback. In production the daemon passes a Jupiter adapter so live
+    /// SOL price drives the filter math.
+    pub fn spawn(cfg: CopyTraderCfg, sol_usd_provider: Option<Arc<dyn CopySolUsd>>) -> CopyChannels {
         let (buy_tx, buy_rx) = mpsc::channel::<CopyTradeSignal>(64);
         let (sell_tx, sell_rx) = mpsc::channel::<CopySellSignal>(64);
         let seen = Arc::new(Mutex::new(DedupRing::new(cfg.dedup_cap)));
+        let sol_cache = Arc::new(SolUsdCache::new(sol_usd_provider));
 
         for target in cfg.targets.clone() {
             let cfg = cfg.clone();
             let buy_tx = buy_tx.clone();
             let sell_tx = sell_tx.clone();
             let seen = seen.clone();
+            let sol_cache = sol_cache.clone();
             let label = target.label.clone();
             tokio::spawn(async move {
                 info!(target=%target.pubkey, label=%label, weight=target.weight,
                     interval=cfg.poll_interval_secs,
                     "📡 copy-trader poller starting");
                 loop {
-                    if let Err(e) = poll_once(&cfg, &target, &buy_tx, &sell_tx, &seen).await {
+                    if let Err(e) = poll_once(&cfg, &target, &buy_tx, &sell_tx, &seen, &sol_cache).await {
                         warn!(target=%target.pubkey, error=?e, "copy-trader poll iteration failed");
                     }
                     tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
@@ -319,6 +414,7 @@ async fn poll_once(
     buy_tx: &mpsc::Sender<CopyTradeSignal>,
     sell_tx: &mpsc::Sender<CopySellSignal>,
     seen: &Arc<Mutex<DedupRing>>,
+    sol_cache: &Arc<SolUsdCache>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "https://api.helius.xyz/v0/addresses/{}/transactions?api-key={}&limit={}",
@@ -344,6 +440,7 @@ async fn poll_once(
     let txs: Vec<HeliusTx> = resp.json().await?;
     debug!(target=%target.pubkey, count=txs.len(), "copy-trader: fetched txs");
 
+    let sol_usd = sol_cache.get().await;
     let now_ms = chrono::Utc::now().timestamp_millis();
     for t in txs {
         if t.signature.is_empty() {
@@ -362,7 +459,7 @@ async fn poll_once(
         }
 
         // BUY detection: "target paid SOL/USDC, received a non-stable token".
-        if let Some(buy) = detect_buy(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint) {
+        if let Some(buy) = detect_buy(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint, sol_usd) {
             if buy.his_size_usd < cfg.min_copy_usd {
                 debug!(target=%target.pubkey, mint=%buy.mint, his_size_usd=buy.his_size_usd,
                     min=cfg.min_copy_usd, "copy-trader: skip buy — below min_copy_usd");
@@ -393,7 +490,7 @@ async fn poll_once(
         // We do NOT apply min_copy_usd here — if he's dumping ANY size on a
         // coin we hold, we want out. Daemon decides whether we actually hold
         // the mint; if not, the signal is a no-op.
-        if let Some(sell) = detect_sell(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint) {
+        if let Some(sell) = detect_sell(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint, sol_usd) {
             info!(
                 target=%target.pubkey, label=%target.label,
                 mint=%sell.mint, his_size_usd=sell.his_size_usd, sig=%t.signature,
@@ -430,17 +527,19 @@ struct DetectedBuy {
 /// - it's a rotation (meme1 → meme2 — we don't follow rotations, too noisy)
 /// - we can't determine size confidently
 ///
-/// Sizing uses native SOL input where available (Jupiter routes typically
-/// expose this); otherwise we sum USDC input. Anything else and we bail.
-fn detect_buy(tx: &HeliusTx, target_pk: &str, sol_mint: &str, usdc_mint: &str) -> Option<DetectedBuy> {
+/// Sizing uses `accountData[target].nativeBalanceChange` — the CANONICAL net
+/// SOL delta for the wallet. For Jupiter-routed pump.fun trades, the
+/// `events.swap.nativeInput` field only reflects the wSOL ATA top-up amount
+/// (often <0.005 SOL of dust) and is NOT the real trade size. That was the
+/// 2026-05-20 bug that broke the bot's min_copy_usd filter.
+fn detect_buy(
+    tx: &HeliusTx,
+    target_pk: &str,
+    sol_mint: &str,
+    usdc_mint: &str,
+    sol_usd: f64,
+) -> Option<DetectedBuy> {
     let swap = tx.events.swap.as_ref()?;
-
-    // SOL spent by target (most common). Helius represents this as nativeInput.
-    let sol_in_lamports: u64 = swap
-        .native_input
-        .as_ref()
-        .and_then(|n| n.amount.parse::<u64>().ok())
-        .unwrap_or(0);
 
     // Sum any USDC he spent. tokenInputs covers direct USDC swaps; for Jupiter
     // multi-hop, the outer-level tokenInputs are still the user's inputs.
@@ -477,14 +576,23 @@ fn detect_buy(tx: &HeliusTx, target_pk: &str, sol_mint: &str, usdc_mint: &str) -
         return None;
     }
 
-    // Size: prefer native SOL input × $90 fallback (we don't have live sol_usd
-    // in this module; daemon will reconcile real value when it queues the
-    // mirror trade). For USDC inputs, units are already USD.
-    // Note: $90/SOL is a fallback; if Jupiter price is stale this can be off
-    // by ±10%, which is fine for a coarse "did he commit real money" check.
-    const SOL_USD_FALLBACK: f64 = 90.0;
-    let sol_in_sol = sol_in_lamports as f64 / 1_000_000_000.0;
-    let his_size_usd = sol_in_sol * SOL_USD_FALLBACK + usdc_in_units;
+    // Sizing: use signed native delta. For a BUY this is negative (target
+    // paid SOL); take the absolute value. Subtract the fee if target is the
+    // fee payer so the size reflects swap value, not swap+gas. For a sub-
+    // dust delta (<= ~rent for an ATA, ~2M lamports), the wallet didn't
+    // actually pay SOL in this tx — likely a USDC-only swap or we missed
+    // the structure — and we fall back to USDC input units.
+    let nbc = target_native_delta(tx, target_pk);
+    let mut sol_paid_lamports: u64 = if nbc < 0 { (-nbc) as u64 } else { 0 };
+    if tx.fee_payer == target_pk {
+        // Don't underflow: only deduct fee if the swap-size dwarfs it.
+        if sol_paid_lamports > tx.fee {
+            sol_paid_lamports -= tx.fee;
+        }
+    }
+    let sol_paid = sol_paid_lamports as f64 / 1_000_000_000.0;
+    let px = if sol_usd > 0.0 { sol_usd } else { SOL_USD_FALLBACK };
+    let his_size_usd = sol_paid * px + usdc_in_units;
 
     if his_size_usd <= 0.0 {
         // Couldn't determine size. Don't fire a signal we can't filter.
@@ -508,7 +616,13 @@ struct DetectedSell {
 /// `tokenTransfers`. We don't apply `min_copy_usd` here — callers will fire
 /// the sell signal regardless and let the daemon decide whether we hold the
 /// mint at all (most of the time we won't, and the signal is a no-op).
-fn detect_sell(tx: &HeliusTx, target_pk: &str, sol_mint: &str, usdc_mint: &str) -> Option<DetectedSell> {
+fn detect_sell(
+    tx: &HeliusTx,
+    target_pk: &str,
+    sol_mint: &str,
+    usdc_mint: &str,
+    sol_usd: f64,
+) -> Option<DetectedSell> {
     let swap = tx.events.swap.as_ref()?;
 
     // The mint he sold: a tokenInput with a non-stable mint.
@@ -536,27 +650,28 @@ fn detect_sell(tx: &HeliusTx, target_pk: &str, sol_mint: &str, usdc_mint: &str) 
         return None;
     }
 
-    // Size from native SOL output if present (Helius doesn't expose nativeOutput
-    // on every shape — fall back to USDC outputs). For SOL outputs Helius
-    // exposes them as tokenOutputs with mint = So111...112; we look for SOL or
-    // USDC mints in the outputs.
-    let sol_out_units: f64 = swap
-        .token_outputs
+    // Sizing: native delta is positive on a sell (target received SOL). We
+    // also pick up any USDC output that landed in his tokenTransfers (rare
+    // for pump.fun coins which always route via SOL, but cheap to include).
+    let nbc = target_native_delta(tx, target_pk);
+    let mut sol_recv_lamports: u64 = if nbc > 0 { nbc as u64 } else { 0 };
+    // Add fee back if target paid it — the swap actually produced `nbc+fee`
+    // lamports of value; the net delta is reduced by gas, but the swap-value
+    // is the gross amount.
+    if tx.fee_payer == target_pk {
+        sol_recv_lamports = sol_recv_lamports.saturating_add(tx.fee);
+    }
+    let sol_recv = sol_recv_lamports as f64 / 1_000_000_000.0;
+
+    let usdc_out_units: f64 = tx
+        .token_transfers
         .iter()
-        .chain(swap.inner_swaps.iter().flat_map(|i| i.token_outputs.iter()))
-        .filter(|t| t.mint == sol_mint)
-        .map(|t| token_amount_to_ui(&t.token_amount))
-        .sum();
-    let usdc_out_units: f64 = swap
-        .token_outputs
-        .iter()
-        .chain(swap.inner_swaps.iter().flat_map(|i| i.token_outputs.iter()))
-        .filter(|t| t.mint == usdc_mint)
-        .map(|t| token_amount_to_ui(&t.token_amount))
+        .filter(|tt| tt.mint == usdc_mint && tt.to == target_pk)
+        .map(|tt| tt.token_amount)
         .sum();
 
-    const SOL_USD_FALLBACK: f64 = 90.0;
-    let his_size_usd = sol_out_units * SOL_USD_FALLBACK + usdc_out_units;
+    let px = if sol_usd > 0.0 { sol_usd } else { SOL_USD_FALLBACK };
+    let his_size_usd = sol_recv * px + usdc_out_units;
 
     // We DON'T bail on his_size_usd == 0 like detect_buy does — some swap
     // shapes don't expose the SOL output cleanly, but if the target sent the
@@ -627,14 +742,19 @@ mod tests {
 
     #[test]
     fn detect_buy_sol_for_meme() {
+        // 1 SOL buy expressed via accountData.nativeBalanceChange (the
+        // canonical signed delta). nativeInput is intentionally noise (the
+        // wSOL ATA top-up amount) to match real Jupiter shapes.
         let json = serde_json::json!({
             "signature": "sig1",
             "timestamp": 1700000000,
             "type": "SWAP",
             "source": "JUPITER",
+            "feePayer": "GakePub",
+            "fee": 5000,
             "events": {
                 "swap": {
-                    "nativeInput": { "amount": "1000000000" }, // 1 SOL
+                    "nativeInput": { "amount": "123456" }, // misleading dust — should be IGNORED
                     "tokenInputs": [],
                     "tokenOutputs": [
                         { "mint": "MemeMint1", "tokenAmount": 1000.0 }
@@ -642,6 +762,9 @@ mod tests {
                     "innerSwaps": []
                 }
             },
+            "accountData": [
+                { "account": "GakePub", "nativeBalanceChange": -1000005000i64 } // paid 1 SOL + 5000 fee
+            ],
             "tokenTransfers": [
                 { "fromUserAccount": "X", "toUserAccount": "GakePub", "mint": "MemeMint1", "tokenAmount": 1000.0 }
             ]
@@ -650,9 +773,101 @@ mod tests {
         let buy = detect_buy(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         ).expect("expected buy");
         assert_eq!(buy.mint, "MemeMint1");
-        assert!((buy.his_size_usd - 90.0).abs() < 0.01); // 1 SOL × $90 fallback
+        assert!((buy.his_size_usd - 90.0).abs() < 0.01,
+            "1 SOL × $90 should be ~$90, got {}", buy.his_size_usd);
+    }
+
+    /// 🔒 REGRESSION (2026-05-20): the bug that caused his_size_usd to show
+    /// as pennies for real $100+ trades. Real Helius response captured from
+    /// a Slingoor SELL (3.4 SOL value); pre-fix the SELL detector read
+    /// `events.swap.nativeInput=3406370` (~0.003 SOL) and the SOL output was
+    /// `null`, yielding his_size_usd=$0.30. Post-fix we use
+    /// `accountData.nativeBalanceChange` and compute the real ~$306 value.
+    #[test]
+    fn detect_sell_uses_account_data_native_delta_real_helius() {
+        let raw = include_str!("../tests/fixtures_helius.json");
+        let fixtures: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
+        // Find the SELL tx (signature starts with Kq567).
+        let sell_json = fixtures.iter()
+            .find(|t| t["signature"].as_str().unwrap_or("").starts_with("Kq567"))
+            .expect("fixture must contain the Slingoor SELL");
+        let tx: HeliusTx = serde_json::from_value(sell_json.clone()).unwrap();
+        let sell = detect_sell(&tx,
+            "6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd",
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
+        ).expect("expected sell");
+        // Real value: ~3.405 SOL × $90 = ~$306. Pre-fix produced $0.30.
+        assert!(
+            sell.his_size_usd > 290.0 && sell.his_size_usd < 320.0,
+            "expected ~$306 for 3.4 SOL sell, got {}", sell.his_size_usd
+        );
+    }
+
+    /// Real Helius BUY fixture (Slingoor bought LMAO for 1.89 SOL). Pre-fix
+    /// this produced his_size_usd = 0.000469539 × 90 = $0.042. Post-fix it
+    /// must be ~$170.
+    #[test]
+    fn detect_buy_uses_account_data_native_delta_real_helius() {
+        let raw = include_str!("../tests/fixtures_helius.json");
+        let fixtures: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
+        let buy_json = fixtures.iter()
+            .find(|t| t["signature"].as_str().unwrap_or("").starts_with("2Gkziq"))
+            .expect("fixture must contain the Slingoor BUY");
+        let tx: HeliusTx = serde_json::from_value(buy_json.clone()).unwrap();
+        let buy = detect_buy(&tx,
+            "6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd",
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
+        ).expect("expected buy");
+        // Real value: ~1.89 SOL × $90 = ~$170. Pre-fix produced $0.04.
+        assert!(
+            buy.his_size_usd > 150.0 && buy.his_size_usd < 200.0,
+            "expected ~$170 for 1.89 SOL buy, got {}", buy.his_size_usd
+        );
+        // his_size_usd MUST be positive for buys (used by min_copy_usd filter).
+        assert!(buy.his_size_usd > 0.0, "buy size must be positive");
+    }
+
+    /// Spec from the bug report: a 0.5 SOL swap must yield $40-$50 at $90/SOL.
+    #[test]
+    fn half_sol_swap_yields_40_to_50_usd() {
+        let json = serde_json::json!({
+            "signature": "sig_half_sol",
+            "type": "SWAP",
+            "feePayer": "TargetWallet",
+            "fee": 50000,
+            "events": {
+                "swap": {
+                    "nativeInput": { "amount": "7654321" }, // noise top-up
+                    "tokenInputs": [],
+                    "tokenOutputs": [{ "mint": "MemeMint1", "tokenAmount": 1000.0 }],
+                    "innerSwaps": []
+                }
+            },
+            "accountData": [
+                { "account": "TargetWallet", "nativeBalanceChange": -500050000i64 } // 0.5 SOL + 50k fee
+            ],
+            "tokenTransfers": [
+                { "fromUserAccount": "Pool", "toUserAccount": "TargetWallet",
+                  "mint": "MemeMint1", "tokenAmount": 1000.0 }
+            ]
+        });
+        let tx: HeliusTx = serde_json::from_value(json).unwrap();
+        let buy = detect_buy(&tx, "TargetWallet",
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
+        ).expect("expected buy");
+        assert!(
+            buy.his_size_usd >= 40.0 && buy.his_size_usd <= 50.0,
+            "0.5 SOL × $90 must be $40-$50, got {}", buy.his_size_usd
+        );
     }
 
     #[test]
@@ -677,29 +892,33 @@ mod tests {
         let buy = detect_buy(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         );
         assert!(buy.is_none(), "should not classify SOL-output swap as a buy");
     }
 
     #[test]
     fn detect_sell_target_dumps_held_mint() {
-        // Target sells MemeMint1 (input) for SOL (output). Token transfer
-        // shows target as the sender. Expect a DetectedSell.
+        // Target sells MemeMint1 (input) for SOL. Sized via accountData
+        // (canonical signed delta). 2.5 SOL received → $225 at $90/SOL.
         let json = serde_json::json!({
             "signature": "sig_sell_1",
             "timestamp": 1700000100,
             "type": "SWAP",
             "source": "JUPITER",
+            "feePayer": "GakePub",
+            "fee": 5000,
             "events": {
                 "swap": {
                     "nativeInput": null,
                     "tokenInputs": [{ "mint": "MemeMint1", "tokenAmount": 1_000_000.0 }],
-                    "tokenOutputs": [
-                        { "mint": "So11111111111111111111111111111111111111112", "tokenAmount": 2.5 }
-                    ],
+                    "tokenOutputs": [],
                     "innerSwaps": []
                 }
             },
+            "accountData": [
+                { "account": "GakePub", "nativeBalanceChange": 2499995000i64 } // 2.5 SOL net (gross 2.5 + fee deducted)
+            ],
             "tokenTransfers": [
                 { "fromUserAccount": "GakePub", "toUserAccount": "PoolX",
                   "mint": "MemeMint1", "tokenAmount": 1_000_000.0 }
@@ -709,10 +928,11 @@ mod tests {
         let sell = detect_sell(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         ).expect("expected a sell");
         assert_eq!(sell.mint, "MemeMint1");
-        // 2.5 SOL × $90 fallback = $225
-        assert!((sell.his_size_usd - 225.0).abs() < 0.01, "got {}", sell.his_size_usd);
+        // 2.5 SOL × $90 fallback = $225 (± fee). Allow $0.10 tolerance.
+        assert!((sell.his_size_usd - 225.0).abs() < 0.10, "got {}", sell.his_size_usd);
     }
 
     #[test]
@@ -739,6 +959,7 @@ mod tests {
         let sell = detect_sell(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         );
         assert!(sell.is_none(), "buy-shape tx should not be detected as a sell");
     }
@@ -771,6 +992,7 @@ mod tests {
         let sell = detect_sell(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         ).expect("rotation should still emit sell signal for the dumped mint");
         assert_eq!(sell.mint, "MemeMint1");
         assert_eq!(sell.his_size_usd, 0.0, "no SOL/USDC output → zero size");
@@ -802,6 +1024,7 @@ mod tests {
         let sell = detect_sell(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         );
         assert!(sell.is_none());
     }
@@ -865,6 +1088,7 @@ mod tests {
         let buy = detect_buy(&tx, "GakePub",
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
         );
         assert!(buy.is_none());
     }

@@ -2,7 +2,18 @@ use crate::bonding_curve::{CurveSubscriber, CurveTracker};
 use crate::mcap_watcher::{McapWatcher, WatcherCfg, JupiterSolUsd, BandCrossing};
 use crate::momentum_detector::{MomentumDetector, MomentumCfg, MomentumSignal};
 use crate::livestream_poller::{LivestreamPoller, LivestreamCfg, LivestreamSignal, to_new_token as livestream_to_new_token};
-use crate::copy_trader::{CopyTrader, CopyTraderCfg, to_new_token as copy_to_new_token};
+use crate::copy_trader::{CopySolUsd, CopyTrader, CopyTraderCfg, to_new_token as copy_to_new_token};
+
+/// Adapter so `Arc<Jupiter>` can drive the copy-trader's SOL/USD lookup
+/// without pulling the jupiter module into the lib crate.
+struct CopyJupiterSolUsd(Arc<Jupiter>);
+
+#[async_trait::async_trait]
+impl CopySolUsd for CopyJupiterSolUsd {
+    async fn sol_usd(&self) -> f64 {
+        self.0.sol_usd().await.unwrap_or(0.0)
+    }
+}
 use crate::watchdog::Watchdog;
 use solana_sdk::signer::Signer;
 use crate::config::Config;
@@ -837,7 +848,11 @@ Wallet `{}`  cap `{} SOL`",
         for t in &copy_cfg.targets {
             info!(target=%t.pubkey, label=%t.label, weight=t.weight, "🎯 copy-trader target wallet");
         }
-        let chans = CopyTrader::spawn(copy_cfg);
+        // Pass the live Jupiter SOL/USD provider so his_size_usd reflects
+        // real prices instead of the $90 fallback. Provider has its own 30s
+        // internal cache to avoid hammering Jupiter on every poll.
+        let copy_sol_provider: Arc<dyn CopySolUsd> = Arc::new(CopyJupiterSolUsd(jup.clone()));
+        let chans = CopyTrader::spawn(copy_cfg, Some(copy_sol_provider));
         // Buy task: route to handle_new_token.
         {
             let mut buys_rx = chans.buys;
