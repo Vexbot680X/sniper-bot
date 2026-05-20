@@ -1,0 +1,36 @@
+[package]
+name = "hype"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus <nexus@vexbot>"]
+description = "Hype scoring skill — feeds the copy-trade bot and standalone moon-scanner"
+
+# Standalone crate (parent sniper-bot is not a workspace). Target dir is local.
+[lib]
+name = "hype"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hype_query"
+path = "src/bin/hype_query.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
