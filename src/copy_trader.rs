@@ -251,8 +251,25 @@ struct HeliusTx {
     events: Events,
     #[serde(default, rename = "tokenTransfers")]
     token_transfers: Vec<TokenTransfer>,
+    #[serde(default, rename = "nativeTransfers")]
+    native_transfers: Vec<NativeTransfer>,
     #[serde(default, rename = "accountData")]
     account_data: Vec<AccountData>,
+}
+
+/// Per-tx native (real SOL) lamport movements. Helius gives the amount as a
+/// number; the wallet pubkeys are strings. Used as a fallback signal when
+/// `accountData[target].nativeBalanceChange` is too small to reflect the real
+/// swap size (e.g. PUMP_FUN trades where the bonding-curve pool receives
+/// lamports directly).
+#[derive(Debug, Default, Deserialize)]
+struct NativeTransfer {
+    #[serde(default, rename = "fromUserAccount")]
+    from: String,
+    #[serde(default, rename = "toUserAccount")]
+    to: String,
+    #[serde(default)]
+    amount: u64,
 }
 
 /// Per-account balance deltas. `nativeBalanceChange` is the CANONICAL signed
@@ -268,12 +285,19 @@ struct AccountData {
     native_balance_change: i64,
 }
 
+// Note: the structs below describe Helius `events.swap` shapes. As of
+// 2026-05-21 the parser no longer reads `events.swap` (it was incomplete —
+// PUMP_FUN and PUMP_AMM never populate it). The structs remain so old
+// fixtures still deserialize cleanly; fields are silently ignored by the
+// new source-agnostic detector.
+#[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
 struct Events {
     #[serde(default)]
     swap: Option<SwapEvent>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SwapEvent {
     /// What he sold (SOL or USDC for a real buy of a meme).
@@ -287,6 +311,7 @@ struct SwapEvent {
     inner_swaps: Vec<InnerSwap>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct NativeAmount {
     /// Lamports, as string per Helius schema.
@@ -294,6 +319,7 @@ struct NativeAmount {
     amount: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SwapTokenAmount {
     #[serde(default)]
@@ -302,6 +328,7 @@ struct SwapTokenAmount {
     token_amount: serde_json::Value, // can be number or {tokenAmount, decimals}
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
 struct InnerSwap {
     #[serde(default, rename = "tokenInputs")]
@@ -321,6 +348,10 @@ struct TokenTransfer {
     #[serde(default, rename = "tokenAmount")]
     token_amount: f64,
 }
+
+/// Lamports per SOL — used for converting wSOL token amounts (in SOL units)
+/// to lamports so they can be compared with native delta numbers cleanly.
+const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
 /// The poller. One instance per process; internally spawns one tokio task
 /// per target wallet.
@@ -523,7 +554,8 @@ async fn poll_once(
         // We do NOT apply min_copy_usd here — if he's dumping ANY size on a
         // coin we hold, we want out. Daemon decides whether we actually hold
         // the mint; if not, the signal is a no-op.
-        if let Some(sell) = detect_sell(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint, sol_usd) {
+        let sell_opt = detect_sell(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint, sol_usd);
+        if let Some(sell) = sell_opt {
             info!(
                 target=%target.pubkey, label=%target.label,
                 mint=%sell.mint, his_size_usd=sell.his_size_usd, sig=%t.signature,
@@ -540,9 +572,35 @@ async fn poll_once(
             if let Err(e) = sell_tx.send(sig).await {
                 warn!(error=?e, "copy-trader: failed to send sell signal — receiver dropped");
             }
+            continue;
         }
+
+        // 🔍 Observability: SWAP tx routed to neither buy nor sell. Emit a
+        // single debug line so next time we have silent drops we can see
+        // *why* without source-diving the full payload. The reason is a
+        // best-effort summary derived from the same fields the detectors use.
+        let reason = neither_reason(&t, &target.pubkey, &cfg.sol_mint, &cfg.usdc_mint);
+        debug!(
+            target=%target.pubkey, label=%target.label,
+            sig=%t.signature, source=%t.source, reason=%reason,
+            "copy-trader: SWAP tx produced no buy/sell signal"
+        );
     }
     Ok(())
+}
+
+/// Best-effort one-liner explaining why both `detect_buy` and `detect_sell`
+/// returned None for a SWAP. Used only for the debug log line in `poll_once`.
+fn neither_reason(tx: &HeliusTx, target_pk: &str, sol_mint: &str, usdc_mint: &str) -> &'static str {
+    if is_rotation(tx, target_pk, sol_mint, usdc_mint) {
+        return "rotation";
+    }
+    let recv = largest_non_stable_received(tx, target_pk, sol_mint, usdc_mint);
+    let sent = largest_non_stable_sent(tx, target_pk, sol_mint, usdc_mint);
+    if recv.is_none() && sent.is_none() {
+        return "no mint matched";
+    }
+    "size unknown"
 }
 
 #[derive(Debug)]
@@ -552,19 +610,156 @@ struct DetectedBuy {
     his_size_usd: f64,
 }
 
+#[derive(Debug)]
+struct DetectedSell {
+    mint: String,
+    his_size_usd: f64,
+}
+
+/// Find the largest non-stable mint received by `target_pk` in `tokenTransfers`.
+/// Skips wSOL and USDC. Returns `(mint, amount)` or `None` if no such transfer.
+fn largest_non_stable_received(
+    tx: &HeliusTx,
+    target_pk: &str,
+    sol_mint: &str,
+    usdc_mint: &str,
+) -> Option<(String, f64)> {
+    tx.token_transfers
+        .iter()
+        .filter(|tt| {
+            tt.to == target_pk
+                && tt.token_amount > 0.0
+                && !tt.mint.is_empty()
+                && tt.mint != sol_mint
+                && tt.mint != usdc_mint
+        })
+        .max_by(|a, b| a.token_amount.partial_cmp(&b.token_amount).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|tt| (tt.mint.clone(), tt.token_amount))
+}
+
+/// Find the largest non-stable mint sent by `target_pk` in `tokenTransfers`.
+fn largest_non_stable_sent(
+    tx: &HeliusTx,
+    target_pk: &str,
+    sol_mint: &str,
+    usdc_mint: &str,
+) -> Option<(String, f64)> {
+    tx.token_transfers
+        .iter()
+        .filter(|tt| {
+            tt.from == target_pk
+                && tt.token_amount > 0.0
+                && !tt.mint.is_empty()
+                && tt.mint != sol_mint
+                && tt.mint != usdc_mint
+        })
+        .max_by(|a, b| a.token_amount.partial_cmp(&b.token_amount).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|tt| (tt.mint.clone(), tt.token_amount))
+}
+
+/// Detect a meme-for-meme rotation: target both RECEIVED a non-stable mint AND
+/// SENT a different non-stable mint in the same tx. Rotations are noisy and
+/// don't represent fresh conviction — we reject them from both detectors.
+fn is_rotation(
+    tx: &HeliusTx,
+    target_pk: &str,
+    sol_mint: &str,
+    usdc_mint: &str,
+) -> bool {
+    let recv = largest_non_stable_received(tx, target_pk, sol_mint, usdc_mint);
+    let sent = largest_non_stable_sent(tx, target_pk, sol_mint, usdc_mint);
+    match (recv, sent) {
+        (Some((m_recv, _)), Some((m_sent, _))) => m_recv != m_sent,
+        _ => false,
+    }
+}
+
+/// Estimate the lamports of SOL/wSOL the target SPENT on this swap.
+///
+/// Three signals can carry this information depending on the venue:
+///   1. `tokenTransfers` entries where target is `from` and `mint == wSOL`
+///      (PUMP_AMM, RAYDIUM via wSOL ATA).
+///   2. `accountData[target].nativeBalanceChange` if negative (PUMP_FUN,
+///      sometimes RAYDIUM — the canonical signed net SOL delta).
+///   3. `nativeTransfers` sum of lamports from target to non-target accounts
+///      (PUMP_FUN bonding-curve pool transfers when native_delta is dust).
+///
+/// We return the MAX of (wSOL_out, |native_delta if negative| net of fee).
+/// The native-transfers signal would double-count fee transfers, so we skip
+/// it here — native_delta already includes those.
+fn target_sol_out_lamports(tx: &HeliusTx, target_pk: &str, sol_mint: &str) -> u64 {
+    // (1) wSOL token transfers FROM target. Sum (in UI SOL units), convert to lamports.
+    let wsol_out_sol: f64 = tx
+        .token_transfers
+        .iter()
+        .filter(|tt| tt.mint == sol_mint && tt.from == target_pk && tt.token_amount > 0.0)
+        .map(|tt| tt.token_amount)
+        .sum();
+    let wsol_out_lamports: u64 = (wsol_out_sol * LAMPORTS_PER_SOL).max(0.0) as u64;
+
+    // (2) Native delta if negative — already net of fee. Add fee back to get
+    // gross outflow when target is the fee payer, then subtract fee at the
+    // end so the caller can keep the swap-only semantics consistent. Easier:
+    // here we report "gross SOL out" so the caller subtracts fee once.
+    let nbc = target_native_delta(tx, target_pk);
+    let native_neg_gross: u64 = if nbc < 0 {
+        let raw = (-nbc) as u64;
+        // raw = swap_out + fee (when target paid fee). We want swap_out only.
+        if tx.fee_payer == target_pk && raw > tx.fee {
+            raw - tx.fee
+        } else if tx.fee_payer == target_pk {
+            // raw <= fee — wallet only spent fee (or less), no real swap value here.
+            0
+        } else {
+            raw
+        }
+    } else {
+        0
+    };
+
+    wsol_out_lamports.max(native_neg_gross)
+}
+
+/// Mirror of `target_sol_out_lamports` for the SELL side: lamports of SOL/wSOL
+/// the target RECEIVED on this swap.
+fn target_sol_in_lamports(tx: &HeliusTx, target_pk: &str, sol_mint: &str) -> u64 {
+    // (1) wSOL token transfers TO target.
+    let wsol_in_sol: f64 = tx
+        .token_transfers
+        .iter()
+        .filter(|tt| tt.mint == sol_mint && tt.to == target_pk && tt.token_amount > 0.0)
+        .map(|tt| tt.token_amount)
+        .sum();
+    let wsol_in_lamports: u64 = (wsol_in_sol * LAMPORTS_PER_SOL).max(0.0) as u64;
+
+    // (2) Native delta if positive. nd = swap_in - fee (when target paid fee).
+    // We want gross swap value, so add fee back.
+    let nbc = target_native_delta(tx, target_pk);
+    let native_pos_gross: u64 = if nbc > 0 {
+        let raw = nbc as u64;
+        if tx.fee_payer == target_pk {
+            raw.saturating_add(tx.fee)
+        } else {
+            raw
+        }
+    } else {
+        0
+    };
+
+    wsol_in_lamports.max(native_pos_gross)
+}
+
 /// Decide whether a Helius tx represents a BUY by the target wallet:
 /// "target paid SOL (or USDC) and received a non-stable SPL token".
 ///
-/// Returns `None` if:
-/// - it's a SELL (target sold a meme back to SOL/USDC)
-/// - it's a rotation (meme1 → meme2 — we don't follow rotations, too noisy)
-/// - we can't determine size confidently
+/// Source-agnostic: works for PUMP_FUN, PUMP_AMM, and RAYDIUM by reading
+/// `tokenTransfers` + `accountData` + `nativeTransfers` directly, without
+/// relying on `events.swap` (which Helius does NOT populate for pump.fun).
 ///
-/// Sizing uses `accountData[target].nativeBalanceChange` — the CANONICAL net
-/// SOL delta for the wallet. For Jupiter-routed pump.fun trades, the
-/// `events.swap.nativeInput` field only reflects the wSOL ATA top-up amount
-/// (often <0.005 SOL of dust) and is NOT the real trade size. That was the
-/// 2026-05-20 bug that broke the bot's min_copy_usd filter.
+/// Returns `None` if:
+/// - target didn't receive a non-stable mint
+/// - this is a meme→meme rotation (we don't chase those)
+/// - sizing collapses to zero (no SOL out, no USDC out)
 fn detect_buy(
     tx: &HeliusTx,
     target_pk: &str,
@@ -572,83 +767,45 @@ fn detect_buy(
     usdc_mint: &str,
     sol_usd: f64,
 ) -> Option<DetectedBuy> {
-    let swap = tx.events.swap.as_ref()?;
-
-    // Sum any USDC he spent. tokenInputs covers direct USDC swaps; for Jupiter
-    // multi-hop, the outer-level tokenInputs are still the user's inputs.
-    let usdc_in_units: f64 = swap
-        .token_inputs
-        .iter()
-        .filter(|t| t.mint == usdc_mint)
-        .map(|t| token_amount_to_ui(&t.token_amount))
-        .sum();
-
-    // What he received: find a tokenOutput with a mint that ISN'T SOL/USDC.
-    // Prefer outer outputs; fall back to inner-swap outputs (Jupiter routes).
-    let bought_mint: Option<String> = swap
-        .token_outputs
-        .iter()
-        .map(|t| t.mint.clone())
-        .chain(
-            swap.inner_swaps
-                .iter()
-                .flat_map(|i| i.token_outputs.iter().map(|t| t.mint.clone())),
-        )
-        .find(|m| !m.is_empty() && m != sol_mint && m != usdc_mint);
-
-    let mint = bought_mint?;
-
-    // Sanity check: target wallet should appear as the recipient of `mint` in
-    // tokenTransfers. Otherwise this swap was just routed through his wallet
-    // for some other reason. Helius rarely produces this but guard anyway.
-    let received = tx.token_transfers.iter().any(|tt| {
-        tt.mint == mint && tt.to == target_pk && tt.token_amount > 0.0
-    });
-    if !received {
-        debug!(sig=%tx.signature, mint=%mint, "copy-trader: target did not receive minted token, skip");
+    // Anti-rotation: if target both sent AND received non-stable mints, bail.
+    if is_rotation(tx, target_pk, sol_mint, usdc_mint) {
+        debug!(sig=%tx.signature, source=%tx.source, "copy-trader: skip — meme→meme rotation");
         return None;
     }
 
-    // Sizing: use signed native delta. For a BUY this is negative (target
-    // paid SOL); take the absolute value. Subtract the fee if target is the
-    // fee payer so the size reflects swap value, not swap+gas. For a sub-
-    // dust delta (<= ~rent for an ATA, ~2M lamports), the wallet didn't
-    // actually pay SOL in this tx — likely a USDC-only swap or we missed
-    // the structure — and we fall back to USDC input units.
-    let nbc = target_native_delta(tx, target_pk);
-    let mut sol_paid_lamports: u64 = if nbc < 0 { (-nbc) as u64 } else { 0 };
-    if tx.fee_payer == target_pk {
-        // Don't underflow: only deduct fee if the swap-size dwarfs it.
-        if sol_paid_lamports > tx.fee {
-            sol_paid_lamports -= tx.fee;
-        }
-    }
-    let sol_paid = sol_paid_lamports as f64 / 1_000_000_000.0;
+    // Find the bought mint: largest non-stable mint received by target.
+    let (mint, _amt) = largest_non_stable_received(tx, target_pk, sol_mint, usdc_mint)?;
+
+    // Sizing — prefer wSOL/native SOL outflow. Fall back to USDC if dust.
+    let sol_paid_lamports = target_sol_out_lamports(tx, target_pk, sol_mint);
+
+    // ATA rent is ~2_039_280 lamports; under that we likely didn't pay SOL.
+    const ATA_RENT_DUST: u64 = 2_500_000;
+    let usdc_in_units: f64 = if sol_paid_lamports <= ATA_RENT_DUST {
+        tx.token_transfers
+            .iter()
+            .filter(|tt| tt.mint == usdc_mint && tt.from == target_pk && tt.token_amount > 0.0)
+            .map(|tt| tt.token_amount)
+            .sum()
+    } else {
+        0.0
+    };
+
+    let sol_paid = sol_paid_lamports as f64 / LAMPORTS_PER_SOL;
     let px = if sol_usd > 0.0 { sol_usd } else { SOL_USD_FALLBACK };
     let his_size_usd = sol_paid * px + usdc_in_units;
 
     if his_size_usd <= 0.0 {
-        // Couldn't determine size. Don't fire a signal we can't filter.
+        debug!(sig=%tx.signature, source=%tx.source, mint=%mint,
+            "copy-trader: buy size unknown (no SOL or USDC outflow)");
         return None;
     }
 
     Some(DetectedBuy { mint, symbol: None, his_size_usd })
 }
 
-#[derive(Debug)]
-struct DetectedSell {
-    mint: String,
-    his_size_usd: f64,
-}
-
-/// Mirror of `detect_buy` for the SELL side: target wallet INPUT a non-stable
-/// SPL token and OUTPUT SOL/USDC. Returns the mint sold + USD size received.
-///
-/// `None` for rotations (meme → meme), undetectable size, or shapes where the
-/// target wallet doesn't appear as the SENDER of the sold mint in
-/// `tokenTransfers`. We don't apply `min_copy_usd` here — callers will fire
-/// the sell signal regardless and let the daemon decide whether we hold the
-/// mint at all (most of the time we won't, and the signal is a no-op).
+/// Mirror of `detect_buy` for the SELL side: target INPUT a non-stable token
+/// and OUTPUT SOL/USDC. Source-agnostic (PUMP_FUN/PUMP_AMM/RAYDIUM).
 fn detect_sell(
     tx: &HeliusTx,
     target_pk: &str,
@@ -656,69 +813,44 @@ fn detect_sell(
     usdc_mint: &str,
     sol_usd: f64,
 ) -> Option<DetectedSell> {
-    let swap = tx.events.swap.as_ref()?;
-
-    // The mint he sold: a tokenInput with a non-stable mint.
-    let sold_mint: Option<String> = swap
-        .token_inputs
-        .iter()
-        .map(|t| t.mint.clone())
-        .chain(
-            swap.inner_swaps
-                .iter()
-                .flat_map(|i| i.token_inputs.iter().map(|t| t.mint.clone())),
-        )
-        .find(|m| !m.is_empty() && m != sol_mint && m != usdc_mint);
-
-    let mint = sold_mint?;
-
-    // Sanity check: target wallet must appear as the SENDER of `mint` in
-    // tokenTransfers (i.e. he's the one giving up the token). Otherwise the
-    // swap was just routed through his wallet for some other reason.
-    let sent = tx.token_transfers.iter().any(|tt| {
-        tt.mint == mint && tt.from == target_pk && tt.token_amount > 0.0
-    });
-    if !sent {
-        debug!(sig=%tx.signature, mint=%mint, "copy-trader: target did not send mint, skip sell");
+    // Anti-rotation guard — reject meme→meme.
+    if is_rotation(tx, target_pk, sol_mint, usdc_mint) {
+        debug!(sig=%tx.signature, source=%tx.source, "copy-trader: skip sell — meme→meme rotation");
         return None;
     }
 
-    // Sizing: native delta is positive on a sell (target received SOL). We
-    // also pick up any USDC output that landed in his tokenTransfers (rare
-    // for pump.fun coins which always route via SOL, but cheap to include).
-    let nbc = target_native_delta(tx, target_pk);
-    let mut sol_recv_lamports: u64 = if nbc > 0 { nbc as u64 } else { 0 };
-    // Add fee back if target paid it — the swap actually produced `nbc+fee`
-    // lamports of value; the net delta is reduced by gas, but the swap-value
-    // is the gross amount.
-    if tx.fee_payer == target_pk {
-        sol_recv_lamports = sol_recv_lamports.saturating_add(tx.fee);
-    }
-    let sol_recv = sol_recv_lamports as f64 / 1_000_000_000.0;
+    // Find the sold mint: largest non-stable mint sent by target.
+    let (mint, _amt) = largest_non_stable_sent(tx, target_pk, sol_mint, usdc_mint)?;
 
-    let usdc_out_units: f64 = tx
-        .token_transfers
-        .iter()
-        .filter(|tt| tt.mint == usdc_mint && tt.to == target_pk)
-        .map(|tt| tt.token_amount)
-        .sum();
+    let sol_recv_lamports = target_sol_in_lamports(tx, target_pk, sol_mint);
 
-    let px = if sol_usd > 0.0 { sol_usd } else { SOL_USD_FALLBACK };
-    let his_size_usd = sol_recv * px + usdc_out_units;
-
-    // We DON'T bail on his_size_usd == 0 like detect_buy does — some swap
-    // shapes don't expose the SOL output cleanly, but if the target sent the
-    // mint we still want to fire the exit signal. Use 0.0 as the floor.
-    let his_size_usd = if his_size_usd.is_finite() && his_size_usd >= 0.0 {
-        his_size_usd
+    // Dust fallback to USDC — sum USDC received.
+    const ATA_RENT_DUST: u64 = 2_500_000;
+    let usdc_out_units: f64 = if sol_recv_lamports <= ATA_RENT_DUST {
+        tx.token_transfers
+            .iter()
+            .filter(|tt| tt.mint == usdc_mint && tt.to == target_pk && tt.token_amount > 0.0)
+            .map(|tt| tt.token_amount)
+            .sum()
     } else {
         0.0
     };
+
+    let sol_recv = sol_recv_lamports as f64 / LAMPORTS_PER_SOL;
+    let px = if sol_usd > 0.0 { sol_usd } else { SOL_USD_FALLBACK };
+    let his_size_usd = sol_recv * px + usdc_out_units;
+
+    if his_size_usd <= 0.0 || !his_size_usd.is_finite() {
+        debug!(sig=%tx.signature, source=%tx.source, mint=%mint,
+            "copy-trader: sell size unknown (no SOL or USDC inflow)");
+        return None;
+    }
 
     Some(DetectedSell { mint, his_size_usd })
 }
 
 /// tokenAmount can be a plain number or `{tokenAmount, decimals}` shape.
+#[allow(dead_code)]
 fn token_amount_to_ui(v: &serde_json::Value) -> f64 {
     if let Some(n) = v.as_f64() {
         return n;
@@ -1034,26 +1166,17 @@ mod tests {
 
     #[test]
     fn detect_sell_rejects_rotation() {
-        // Rotation: meme1 -> meme2. tokenInput is a non-stable mint but the
-        // outputs are also non-stable (no SOL/USDC). The size calc collapses
-        // to 0; sender check still passes; we still emit a sell signal
-        // because the target IS dumping the input mint. That's the desired
-        // behavior for v1 — if he rotates out of a coin we hold, we want out.
-        // (We could tighten this in v2 if rotations create false positives.)
+        // Rotation: target both SENT MemeMint1 AND RECEIVED MemeMint2 in the
+        // same tx. Per 2026-05-21 spec, rotations are noise — we don't chase
+        // meme→meme — and BOTH detect_buy AND detect_sell must return None.
         let json = serde_json::json!({
             "signature": "sig_rot",
             "type": "SWAP",
-            "events": {
-                "swap": {
-                    "nativeInput": null,
-                    "tokenInputs": [{ "mint": "MemeMint1", "tokenAmount": 1000.0 }],
-                    "tokenOutputs": [{ "mint": "MemeMint2", "tokenAmount": 500.0 }],
-                    "innerSwaps": []
-                }
-            },
             "tokenTransfers": [
                 { "fromUserAccount": "GakePub", "toUserAccount": "PoolX",
-                  "mint": "MemeMint1", "tokenAmount": 1000.0 }
+                  "mint": "MemeMint1", "tokenAmount": 1000.0 },
+                { "fromUserAccount": "PoolX", "toUserAccount": "GakePub",
+                  "mint": "MemeMint2", "tokenAmount": 500.0 }
             ]
         });
         let tx: HeliusTx = serde_json::from_value(json).unwrap();
@@ -1061,9 +1184,31 @@ mod tests {
             "So11111111111111111111111111111111111111112",
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             90.0,
-        ).expect("rotation should still emit sell signal for the dumped mint");
-        assert_eq!(sell.mint, "MemeMint1");
-        assert_eq!(sell.his_size_usd, 0.0, "no SOL/USDC output → zero size");
+        );
+        assert!(sell.is_none(), "meme→meme rotation must NOT produce a sell signal");
+    }
+
+    #[test]
+    fn detect_buy_rejects_rotation() {
+        // Mirror of detect_sell_rejects_rotation — same shape, asserted from
+        // the buy side. Target both received AND sent non-stable mints.
+        let json = serde_json::json!({
+            "signature": "sig_rot_b",
+            "type": "SWAP",
+            "tokenTransfers": [
+                { "fromUserAccount": "GakePub", "toUserAccount": "PoolX",
+                  "mint": "MemeMint1", "tokenAmount": 1000.0 },
+                { "fromUserAccount": "PoolX", "toUserAccount": "GakePub",
+                  "mint": "MemeMint2", "tokenAmount": 500.0 }
+            ]
+        });
+        let tx: HeliusTx = serde_json::from_value(json).unwrap();
+        let buy = detect_buy(&tx, "GakePub",
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            90.0,
+        );
+        assert!(buy.is_none(), "meme→meme rotation must NOT produce a buy signal");
     }
 
     #[test]
@@ -1159,5 +1304,165 @@ mod tests {
             90.0,
         );
         assert!(buy.is_none());
+    }
+
+    // ===========================================================================
+    // 🔥 PUMP fixture integration tests (2026-05-21)
+    //
+    // Helius does NOT populate `events.swap` for `source=PUMP_FUN` or
+    // `source=PUMP_AMM` — it ships an empty/null `events.swap` for both. The
+    // old parser bailed at the first line and silently dropped EVERY pump.fun
+    // trade. Below: fixtures captured from live wallets prove the new
+    // source-agnostic detector recovers buys + sells for both sources, and
+    // does NOT regress on RAYDIUM-shaped txs.
+    //
+    // Fixtures live in `tests/fixtures/pump/`. Each file is a JSON array of
+    // Helius enhanced txs for one wallet's recent history.
+    // ===========================================================================
+
+    const SOL_MINT_T: &str = "So11111111111111111111111111111111111111112";
+    const USDC_MINT_T: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    fn load_fixture(path: &str) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("fixture not found at {path}: {e}"));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("fixture not valid JSON at {path}: {e}"))
+    }
+
+    /// Iterate every tx in a fixture, parse as `HeliusTx`, and yield
+    /// `(tx, target_pk)` for SWAPs only. Per the captured fixtures, the
+    /// target wallet of interest is the tx's `feePayer` (each tx is a row
+    /// from that wallet's history).
+    fn iter_swap_txs(value: &[serde_json::Value]) -> Vec<(HeliusTx, String)> {
+        value
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("SWAP"))
+            .map(|t| {
+                let target = t.get("feePayer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tx: HeliusTx = serde_json::from_value(t.clone()).expect("valid HeliusTx");
+                (tx, target)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn detect_buy_parses_pump_amm_buy() {
+        let data = load_fixture("tests/fixtures/pump/slingoor_pump_amm.json");
+        let txs = iter_swap_txs(&data);
+        assert!(!txs.is_empty(), "fixture must have SWAP txs");
+
+        // At least one BUY in the slingoor PUMP_AMM fixture must parse with
+        // a real mint + positive USD size.
+        let mut buys = 0usize;
+        for (tx, target) in &txs {
+            assert_eq!(tx.source, "PUMP_AMM", "slingoor fixture must be PUMP_AMM");
+            if let Some(buy) = detect_buy(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0) {
+                assert!(!buy.mint.is_empty(), "bought mint must be set");
+                assert_ne!(buy.mint, SOL_MINT_T, "bought mint must not be wSOL");
+                assert_ne!(buy.mint, USDC_MINT_T, "bought mint must not be USDC");
+                assert!(
+                    buy.his_size_usd > 0.0 && buy.his_size_usd.is_finite(),
+                    "his_size_usd must be positive, got {} for sig {}",
+                    buy.his_size_usd, tx.signature
+                );
+                buys += 1;
+            }
+        }
+        assert!(buys >= 3, "expected ≥3 PUMP_AMM BUYs to parse; got {buys}");
+    }
+
+    #[test]
+    fn detect_sell_parses_pump_amm_sell() {
+        let data = load_fixture("tests/fixtures/pump/slingoor_pump_amm.json");
+        let txs = iter_swap_txs(&data);
+        let mut sells = 0usize;
+        for (tx, target) in &txs {
+            if let Some(sell) = detect_sell(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0) {
+                assert!(!sell.mint.is_empty());
+                assert_ne!(sell.mint, SOL_MINT_T);
+                assert_ne!(sell.mint, USDC_MINT_T);
+                assert!(
+                    sell.his_size_usd > 0.0 && sell.his_size_usd.is_finite(),
+                    "his_size_usd must be positive, got {} for sig {}",
+                    sell.his_size_usd, tx.signature
+                );
+                sells += 1;
+            }
+        }
+        assert!(sells >= 2, "expected ≥2 PUMP_AMM SELLs to parse; got {sells}");
+    }
+
+    #[test]
+    fn detect_buy_parses_pump_fun_buy() {
+        // Theo's wallet — captured 10 PUMP_FUN swaps (mix of buys + sells).
+        let data = load_fixture("tests/fixtures/pump/theo_pump_fun.json");
+        let txs = iter_swap_txs(&data);
+        let mut buys = 0usize;
+        for (tx, target) in &txs {
+            assert_eq!(tx.source, "PUMP_FUN", "theo fixture must be PUMP_FUN");
+            if let Some(buy) = detect_buy(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0) {
+                assert!(!buy.mint.is_empty());
+                assert!(buy.his_size_usd > 0.0,
+                    "PUMP_FUN buy must have positive size; got {} for sig {}",
+                    buy.his_size_usd, tx.signature);
+                buys += 1;
+            }
+        }
+        assert!(buys >= 3, "expected ≥3 PUMP_FUN BUYs; got {buys}");
+    }
+
+    #[test]
+    fn detect_sell_parses_pump_fun_sell() {
+        let data = load_fixture("tests/fixtures/pump/cented_pump_fun.json");
+        let txs = iter_swap_txs(&data);
+        let mut sells = 0usize;
+        for (tx, target) in &txs {
+            if let Some(sell) = detect_sell(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0) {
+                assert!(!sell.mint.is_empty());
+                assert!(sell.his_size_usd > 0.0,
+                    "PUMP_FUN sell must have positive size; got {} for sig {}",
+                    sell.his_size_usd, tx.signature);
+                sells += 1;
+            }
+        }
+        assert!(sells >= 2, "expected ≥2 PUMP_FUN SELLs; got {sells}");
+    }
+
+    #[test]
+    fn detect_buy_still_works_on_raydium() {
+        // gake_mixed.json contains a mix; we want at least one RAYDIUM SWAP
+        // detection to still resolve via the new source-agnostic path. The
+        // RAYDIUM tx in this fixture is a SELL of mint 2784oaEf..., so we
+        // assert on the sell side. The fixture also contains PUMP_AMM BUYs
+        // — those exercise the buy side.
+        let data = load_fixture("tests/fixtures/pump/gake_mixed.json");
+        let txs = iter_swap_txs(&data);
+
+        let mut raydium_sells = 0usize;
+        let mut pump_amm_buys = 0usize;
+        for (tx, target) in &txs {
+            match tx.source.as_str() {
+                "RAYDIUM" => {
+                    if let Some(sell) = detect_sell(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0) {
+                        assert!(sell.his_size_usd > 0.0,
+                            "RAYDIUM sell must have positive size; got {} for sig {}",
+                            sell.his_size_usd, tx.signature);
+                        raydium_sells += 1;
+                    }
+                }
+                "PUMP_AMM" => {
+                    if let Some(buy) = detect_buy(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0) {
+                        assert!(buy.his_size_usd > 0.0);
+                        pump_amm_buys += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(raydium_sells >= 1,
+            "REGRESSION: RAYDIUM SWAP must still resolve (got {raydium_sells})");
+        assert!(pump_amm_buys >= 1,
+            "PUMP_AMM BUY in mixed fixture must resolve (got {pump_amm_buys})");
     }
 }

@@ -120,3 +120,27 @@ zero SOL spent. Full writeup in [`LIVE_BUG_FIX_REPORT.md`](./LIVE_BUG_FIX_REPORT
 
 Bot remains in paper mode pending Mamba's manual dust-trade verification
 (checklist box 3 above).
+
+---
+
+## 2026-05-21 — incidental test failures discovered during copy-trader fix
+
+While verifying the PUMP_FUN/PUMP_AMM detection fix (see commit log), two
+unrelated pre-existing test failures surfaced when running `cargo test
+--release` (full suite). Both are **outside** `copy_trader` and unrelated to
+this change. Not fixing here per "don't fix two things at once unless
+trivially related" rule. Flagging for follow-up:
+
+1. **`config::copy_trade_config_tests::copy_trade_toml_parses_with_14_finalists_and_watchdog`**
+   — asserts `watchdog.session_duration_secs == 7200`, but `config.copy-trade.toml`
+   was edited (uncommitted, by Mamba per inline comment) to `28800` (8h session
+   for overnight). Either update the test to match the new value, or revert the
+   toml. Test, not bot, is wrong. Trivial fix.
+
+2. **`paper_slippage::tests::exit_slippage_pulls_price_down_single_shot`** —
+   asserts entry/exit slippage symmetry but the implementation isn't symmetric
+   in magnitude under current parameters. Real bug in paper-mode simulator
+   only; live trading unaffected.
+
+All `copy_trader::*` tests pass (21/21) including the 5 new pump fixture
+integration tests.
