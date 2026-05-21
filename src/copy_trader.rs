@@ -133,6 +133,10 @@ pub struct CopyTraderCfg {
     /// SELL not a BUY of the output token (we don't want to copy rotations).
     pub sol_mint: String,
     pub usdc_mint: String,
+    /// 🎯 INITIAL BACKLOG SUPPRESSION (2026-05-20): when false (default), the
+    /// first poll per target marks all returned signatures as "seen" WITHOUT
+    /// emitting signals. Those are historical trades — not fresh opportunities.
+    pub emit_initial_backlog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +182,7 @@ impl CopyTraderCfg {
             dedup_cap: cc.dedup_cap.max(64),
             sol_mint: "So11111111111111111111111111111111111111112".to_string(),
             usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            emit_initial_backlog: cc.emit_initial_backlog,
         })
     }
 }
@@ -387,11 +392,18 @@ impl CopyTrader {
             tokio::spawn(async move {
                 info!(target=%target.pubkey, label=%label, weight=target.weight,
                     interval=cfg.poll_interval_secs,
+                    emit_initial_backlog=cfg.emit_initial_backlog,
                     "📡 copy-trader poller starting");
+                // 🎯 INITIAL BACKLOG SUPPRESSION: the first poll per target marks
+                // all signatures as seen without emitting. Historical trades
+                // are NOT fresh opportunities; we only emit signals discovered
+                // AFTER bot startup.
+                let mut is_first_poll = !cfg.emit_initial_backlog;
                 loop {
-                    if let Err(e) = poll_once(&cfg, &target, &buy_tx, &sell_tx, &seen, &sol_cache).await {
+                    if let Err(e) = poll_once(&cfg, &target, &buy_tx, &sell_tx, &seen, &sol_cache, is_first_poll).await {
                         warn!(target=%target.pubkey, error=?e, "copy-trader poll iteration failed");
                     }
+                    is_first_poll = false;
                     tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await;
                 }
             });
@@ -408,6 +420,9 @@ fn mask_key(k: &str) -> String {
 
 /// One poll cycle for one target wallet. Detects BOTH buys and sells from
 /// the same fetch — one Helius request, two emitters.
+///
+/// When `prime_only=true` (initial backlog suppression), every signature is
+/// marked as seen but NO signals are emitted. Subsequent polls run normally.
 async fn poll_once(
     cfg: &CopyTraderCfg,
     target: &TargetWallet,
@@ -415,6 +430,7 @@ async fn poll_once(
     sell_tx: &mpsc::Sender<CopySellSignal>,
     seen: &Arc<Mutex<DedupRing>>,
     sol_cache: &Arc<SolUsdCache>,
+    prime_only: bool,
 ) -> anyhow::Result<()> {
     let url = format!(
         "https://api.helius.xyz/v0/addresses/{}/transactions?api-key={}&limit={}",
@@ -440,13 +456,30 @@ async fn poll_once(
     let txs: Vec<HeliusTx> = resp.json().await?;
     debug!(target=%target.pubkey, count=txs.len(), "copy-trader: fetched txs");
 
+    // 🎯 INITIAL BACKLOG SUPPRESSION: prime the dedup ring with this batch
+    // of historical signatures and return WITHOUT emitting any signals.
+    if prime_only {
+        let mut primed = 0usize;
+        {
+            let mut s = seen.lock().await;
+            for t in &txs {
+                if t.signature.is_empty() { continue; }
+                if s.insert(&t.signature) { primed += 1; }
+            }
+        }
+        info!(target=%target.pubkey, label=%target.label, primed,
+            "✅ copy-trade dedup primed with {} historical signatures", primed);
+        return Ok(());
+    }
+
     let sol_usd = sol_cache.get().await;
     let now_ms = chrono::Utc::now().timestamp_millis();
     for t in txs {
         if t.signature.is_empty() {
             continue;
         }
-        // Dedup first — cheapest filter.
+        // Dedup first — cheapest filter. Persistent across poll iterations
+        // for the lifetime of the bot process (the ring is shared via Arc).
         {
             let mut s = seen.lock().await;
             if !s.insert(&t.signature) {
@@ -738,6 +771,41 @@ mod tests {
         assert!(!r.insert("a")); // dup
         assert!(r.insert("c")); // evicts "a"
         assert!(r.insert("a")); // "a" is fresh again
+    }
+
+    /// 🔒 REGRESSION (2026-05-20): dedup MUST persist across poll iterations
+    /// so the same Helius signature returned by two consecutive polls does
+    /// NOT emit two signals. The ring is shared via Arc<Mutex<>> and lives
+    /// for the lifetime of the CopyTrader instance — simulate that here
+    /// by sharing one DedupRing across two "polls" returning the same sig.
+    #[test]
+    fn dedup_persists_across_polls() {
+        let ring = Arc::new(std::sync::Mutex::new(DedupRing::new(256)));
+        let sig = "5xZyHistoricalSignatureFromHelius";
+
+        // Simulated poll 1: signature is new, must be inserted.
+        let emitted_1 = {
+            let mut r = ring.lock().unwrap();
+            r.insert(sig)
+        };
+        assert!(emitted_1, "first poll: signature must be NEW");
+
+        // Simulated poll 2 (same Helius payload, ~7s later): the same sig
+        // is returned again. It MUST NOT be re-emitted.
+        let emitted_2 = {
+            let mut r = ring.lock().unwrap();
+            r.insert(sig)
+        };
+        assert!(!emitted_2,
+            "second poll: signature MUST be deduped — ring is non-persistent");
+
+        // Simulated poll 3 with the same sig + a new sig: only the new one fires.
+        let emitted_3 = {
+            let mut r = ring.lock().unwrap();
+            (r.insert(sig), r.insert("freshSignatureAfterBotStart"))
+        };
+        assert_eq!(emitted_3, (false, true),
+            "third poll: old sig stays deduped, new sig emits");
     }
 
     #[test]

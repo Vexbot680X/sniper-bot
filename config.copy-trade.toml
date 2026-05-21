@@ -252,7 +252,7 @@ log_dir = "logs"
 [copy_trader]
 enabled = true
 poll_interval_secs = 7
-min_copy_usd = 200.0     # only mirror trades where they committed real money
+min_copy_usd = 10.0    # patched 2026-05-20 19:46 UTC — was 200 (Vex default), too high for our wallet mix
 fetch_limit = 20         # last N txs per poll per wallet
 dedup_cap = 256
 

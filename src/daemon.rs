@@ -1007,6 +1007,24 @@ async fn handle_new_token(
     mcap_watcher: Option<&McapWatcher>,
     tok: pumpportal::NewToken,
 ) -> Result<()> {
+    // 🎯 COPY-TRADE OBSERVABILITY (2026-05-20): a copy-trade signal differs
+    // from a normal launch in 3 ways: (1) we trust the SOURCE wallet, not
+    // the dev; (2) curve state isn't carried on the NewToken (Helius doesn't
+    // expose it) so we have to fetch via WS subscribe-and-wait; (3) the
+    // signal is inherently 5–10s delayed by the Helius poll cadence, so the
+    // max_curve_age_ms stale-curve gate (1500ms) would always reject. We
+    // log every entry attempt + every filter rejection naming the filter so
+    // we can debug "signal went into a void" failures.
+    let is_copy_trade = tok.copy_source_wallet.is_some();
+    if is_copy_trade {
+        info!(
+            mint = %tok.mint,
+            target = tok.copy_source_label.as_deref().unwrap_or("?"),
+            target_pubkey = tok.copy_source_wallet.as_deref().unwrap_or("?"),
+            "📥 copy-trade ENTRY ATTEMPT"
+        );
+    }
+
     // 🛡️ Phase 3 Feature.3: record EVERY observed launch against its dev
     // pubkey, before any filter runs, so the 24h rolling count stays accurate
     // even on tokens we never consider trading. PumpPortal's `traderPublicKey`
@@ -1037,6 +1055,10 @@ async fn handle_new_token(
                 match db.is_dev_blacklisted(dev) {
                     Ok(true) => {
                         let reason = "dev_blacklisted";
+                        if is_copy_trade {
+                            info!(mint=%tok.mint, filter="dev_vetting", dev=%dev,
+                                "🚧 copy-trade FILTER reason=dev_blacklisted");
+                        }
                         info!(mint=%tok.mint, dev=%dev, "❌ dev blacklisted — entry refused");
                         let _ = db.record_rejection(&tok.mint, reason);
                         return Ok(());
@@ -1049,6 +1071,10 @@ async fn handle_new_token(
                 match db.count_dev_deployments_since(dev, since) {
                     Ok(n) if n > cfg.trading.dev_vetting_max_launches_24h => {
                         let reason = format!("serial_rugger_{}_launches_24h", n);
+                        if is_copy_trade {
+                            info!(mint=%tok.mint, filter="dev_vetting", launches_24h=n,
+                                "🚧 copy-trade FILTER reason=serial_rugger");
+                        }
                         info!(
                             mint=%tok.mint, dev=%dev, launches_24h=n,
                             max_allowed=cfg.trading.dev_vetting_max_launches_24h,
@@ -1083,6 +1109,10 @@ async fn handle_new_token(
                         && score <= cfg.trading.dev_reputation_refuse_below
                     {
                         let reason = format!("dev_reputation_too_low {:.3} <= {:.3}", score, cfg.trading.dev_reputation_refuse_below);
+                        if is_copy_trade {
+                            info!(mint=%tok.mint, filter="dev_reputation", score=score,
+                                "🚧 copy-trade FILTER reason=dev_reputation_too_low");
+                        }
                         info!(
                             mint=%tok.mint, dev=%dev,
                             score=%format!("{:.3}", score),
@@ -1125,44 +1155,102 @@ async fn handle_new_token(
     }
 
     let sol_usd = jup.sol_usd().await.unwrap_or(90.0);
-    let decision = scanner::evaluate(cfg, &tok, sol_usd);
-    if !decision.accept {
-        // 2026-05-14: If mcap_watcher is enabled AND the rejection is
-        // "low_mcap" (token is below entry band), enroll it for watching
-        // instead of dropping. The watcher will re-route it back through
-        // this function when its mcap crosses INTO the band.
-        let enrolled = if let Some(w) = mcap_watcher {
-            if decision.reason.starts_with("low_mcap") {
-                w.enroll(&tok).await;
-                true
-            } else { false }
-        } else { false };
-        if !enrolled {
-            info!(mint=%tok.mint, reason=%decision.reason, "❌ filter reject");
-        } else {
-            debug!(mint=%tok.mint, reason=%decision.reason, "📌 enrolled for mcap watch (below entry band)");
+    // 🎯 COPY-TRADE BYPASS: scanner.evaluate is a band-scalp filter for fresh
+    // pumpportal launches (mayhem-mode + mcap band). Copy-trade signals are
+    // high-conviction wallet copies — the source wallet IS the filter. We
+    // skip mayhem_mode (mayhem is noise from trending-poller, not relevant
+    // here) and skip the mcap band check (copy-trades can land anywhere on
+    // the curve; that's fine). Other risk gates (pre_buy_slippage, halt,
+    // bankroll, reservation, dev_vetting via skip_dev_vetting) remain ON.
+    if !is_copy_trade {
+        let decision = scanner::evaluate(cfg, &tok, sol_usd);
+        if !decision.accept {
+            // 2026-05-14: If mcap_watcher is enabled AND the rejection is
+            // "low_mcap" (token is below entry band), enroll it for watching
+            // instead of dropping. The watcher will re-route it back through
+            // this function when its mcap crosses INTO the band.
+            let enrolled = if let Some(w) = mcap_watcher {
+                if decision.reason.starts_with("low_mcap") {
+                    w.enroll(&tok).await;
+                    true
+                } else { false }
+            } else { false };
+            if !enrolled {
+                info!(mint=%tok.mint, reason=%decision.reason, "❌ filter reject");
+            } else {
+                debug!(mint=%tok.mint, reason=%decision.reason, "📌 enrolled for mcap watch (below entry band)");
+            }
+            let _ = db.record_rejection(&tok.mint, &decision.reason);
+            state.lock().await.release_entry_reservation(&tok.mint);
+            return Ok(());
         }
-        let _ = db.record_rejection(&tok.mint, &decision.reason);
-        state.lock().await.release_entry_reservation(&tok.mint);
-        return Ok(());
+    } else {
+        debug!(mint=%tok.mint, "🎯 copy-trade route — scanner.evaluate bypassed (mayhem + mcap band skipped)");
     }
 
     let display_symbol = if tok.symbol.is_empty() { tok.name.clone() } else { tok.symbol.clone() };
-    if let Some(age_ms) = check_and_record_symbol(symbol_cache, &display_symbol).await {
-        let reason = format!("copycat_symbol seen {}s ago", age_ms / 1000);
-        info!(mint=%tok.mint, symbol=%display_symbol, age_ms, "🪞 copy-cat reject");
-        let _ = db.record_rejection(&tok.mint, &reason);
-        state.lock().await.release_entry_reservation(&tok.mint);
-        return Ok(());
+    // 🎯 COPY-TRADE BYPASS: copycat-symbol filter targets dev-spawned name
+    // clones from trending-poller noise. Copy-trade signals come from smart-
+    // money wallet activity — if a watched wallet bought a coin with a
+    // recycled name, that's their bet, not ours to second-guess.
+    if !is_copy_trade {
+        if let Some(age_ms) = check_and_record_symbol(symbol_cache, &display_symbol).await {
+            let reason = format!("copycat_symbol seen {}s ago", age_ms / 1000);
+            info!(mint=%tok.mint, symbol=%display_symbol, age_ms, "🪞 copy-cat reject");
+            let _ = db.record_rejection(&tok.mint, &reason);
+            state.lock().await.release_entry_reservation(&tok.mint);
+            return Ok(());
+        }
     }
 
-    let (v_sol, v_tokens) = match (tok.v_sol, tok.v_tokens) {
-        (Some(s), Some(t)) if t > 0.0 => (s, t),
-        _ => {
+    // 🎯 COPY-TRADE CURVE FETCH (2026-05-20): Helius doesn't expose
+    // bonding-curve state, so v_sol/v_tokens arrive as None on copy-trade
+    // tokens. Subscribe to pumpportal trade events for the mint and wait
+    // up to 3s for a trade tick to populate the curve tracker. Without this
+    // the no_curve_state branch below would silently drop EVERY copy-trade
+    // signal.
+    let (v_sol, v_tokens) = if let (Some(s), Some(t)) = (tok.v_sol, tok.v_tokens) {
+        if t > 0.0 {
+            (s, t)
+        } else {
+            if is_copy_trade {
+                info!(mint=%tok.mint, filter="no_curve_state",
+                      "🚧 copy-trade FILTER reason=no_curve_state — v_tokens<=0");
+            }
             let _ = db.record_rejection(&tok.mint, "no_curve_state");
             state.lock().await.release_entry_reservation(&tok.mint);
             return Ok(());
         }
+    } else if is_copy_trade {
+        // First check if we already track it (another route subscribed earlier).
+        let mut fetched = curves.get(&tok.mint).await;
+        if fetched.is_none() {
+            curve_sub.subscribe(vec![tok.mint.clone()]).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                if let Some(c) = curves.get(&tok.mint).await {
+                    if c.v_sol > 0.0 && c.v_tokens > 0.0 {
+                        fetched = Some(c);
+                        break;
+                    }
+                }
+            }
+        }
+        match fetched {
+            Some(c) if c.v_sol > 0.0 && c.v_tokens > 0.0 => (c.v_sol, c.v_tokens),
+            _ => {
+                info!(mint=%tok.mint, filter="no_curve_state",
+                      "🚧 copy-trade FILTER reason=no_curve_state_after_subscribe — no WS trade tick within 3s");
+                let _ = db.record_rejection(&tok.mint, "no_curve_state_after_subscribe");
+                state.lock().await.release_entry_reservation(&tok.mint);
+                return Ok(());
+            }
+        }
+    } else {
+        let _ = db.record_rejection(&tok.mint, "no_curve_state");
+        state.lock().await.release_entry_reservation(&tok.mint);
+        return Ok(());
     };
 
     // 🛡️ STALE-CURVE GUARD (2026-05-13): if this NewToken frame has been
@@ -1171,7 +1259,12 @@ async fn handle_new_token(
     // enough to invalidate our pre-buy slippage math, leading to a worse
     // entry / exit than we'd accept. Bail before pulling the trigger.
     // Threshold is configurable; default 1500ms. Set to 0 to disable.
-    if cfg.trading.max_curve_age_ms > 0 {
+    //
+    // 🎯 COPY-TRADE BYPASS: copy-trade signals are inherently delayed by the
+    // Helius poll interval (5–10s). We've already fetched fresh curve state
+    // above (via subscribe-and-wait), so the staleness measure (received_at)
+    // is meaningless here — the curve is as fresh as our last WS tick.
+    if cfg.trading.max_curve_age_ms > 0 && !is_copy_trade {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let received = if tok.received_at_ms > 0 { tok.received_at_ms } else { now_ms };
         let age_ms = now_ms - received;
@@ -1183,6 +1276,8 @@ async fn handle_new_token(
             state.lock().await.release_entry_reservation(&tok.mint);
             return Ok(());
         }
+    } else if is_copy_trade {
+        debug!(mint=%tok.mint, "🎯 copy-trade route — max_curve_age_ms bypassed");
     }
 
     curves.upsert(&tok.mint, v_sol, v_tokens).await;
@@ -1207,12 +1302,20 @@ async fn handle_new_token(
     {
         let mut s = state.lock().await;
         if size_usd <= 0.0 || size_usd > s.bankroll_usd {
+            if is_copy_trade {
+                info!(mint=%tok.mint, filter="bankroll", size_usd, bankroll=s.bankroll_usd,
+                    "🚧 copy-trade FILTER reason=bankroll_insufficient");
+            }
             warn!(size_usd, bankroll = s.bankroll_usd, "📉 skipping entry — trading bankroll cannot cover position size");
             s.release_entry_reservation(&tok.mint);
             return Ok(());
         }
     }
     if executor.is_some() && is_halted() {
+        if is_copy_trade {
+            info!(mint=%tok.mint, filter="kill_switch",
+                "🚧 copy-trade FILTER reason=kill_switch_active");
+        }
         warn!(mint=%tok.mint, "skipping entry — kill switch flag present");
         state.lock().await.release_entry_reservation(&tok.mint);
         return Ok(());
@@ -1249,6 +1352,12 @@ async fn handle_new_token(
                         estimated_slippage * 100.0,
                         cfg.trading.pre_buy_slippage_threshold_pct * 100.0,
                     );
+                    if is_copy_trade {
+                        info!(mint=%tok.mint, filter="pre_buy_slippage",
+                            estimated_pct=%format!("{:.2}", estimated_slippage * 100.0),
+                            threshold_pct=%format!("{:.2}", cfg.trading.pre_buy_slippage_threshold_pct * 100.0),
+                            "🚧 copy-trade FILTER reason=pre_buy_slippage_too_high");
+                    }
                     info!(
                         mint=%tok.mint, symbol=%tok.symbol,
                         estimated_slippage_pct=%format!("{:.2}", estimated_slippage * 100.0),
@@ -1308,6 +1417,12 @@ async fn handle_new_token(
             // what position_size_sol is set to. Defense against config typos and
             // accidental scale-ups during dust-trade phase.
             if cfg.trading.position_size_sol > cfg.trading.live_max_position_sol {
+                if is_copy_trade {
+                    info!(mint=%tok.mint, filter="live_position_cap",
+                        requested_sol=cfg.trading.position_size_sol,
+                        cap_sol=cfg.trading.live_max_position_sol,
+                        "🚧 copy-trade FILTER reason=live_position_cap_exceeded");
+                }
                 error!(
                     mint = %tok.mint,
                     requested_sol = cfg.trading.position_size_sol,
@@ -1352,6 +1467,11 @@ async fn handle_new_token(
             }
             match result {
                 Ok(p) => {
+                    if is_copy_trade {
+                        info!(mint=%tok.mint, size_sol=cfg.trading.position_size_sol,
+                            sig=%p.entry_sig.clone().unwrap_or_default(),
+                            "✅ copy-trade BUY SUBMITTED");
+                    }
                     // HEALTH-AUDIT (2026-05-14): record successful buy in
                     // live_attempts so we have a complete audit trail. The
                     // trade_id links this row to the trades table once the
@@ -1378,6 +1498,10 @@ async fn handle_new_token(
                     p
                 }
                 Err(e) => {
+                    if is_copy_trade {
+                        info!(mint=%tok.mint, reason=%format!("{e}"),
+                            "❌ copy-trade BUY FAILED");
+                    }
                     // HEALTH-AUDIT (2026-05-14): classify failure outcome
                     // from the error string so we can aggregate patterns.
                     // Pump.fun Custom(N) errors:
@@ -1467,6 +1591,15 @@ async fn handle_new_token(
         let _ = s.save(&cfg.storage.state_path);
     }
     info!(mint=%pos.mint, symbol=%pos.symbol, entry=pos.entry_price_usd, size=pos.size_usd, mode=%cfg.trading.mode, "🎯 entered position");
+    if is_copy_trade {
+        info!(
+            mint = %pos.mint,
+            entry_usd = pos.entry_price_usd,
+            size_sol = cfg.trading.position_size_sol,
+            target = tok.copy_source_label.as_deref().unwrap_or("?"),
+            "🎯 copy-trade POSITION OPENED"
+        );
+    }
 
     // Phase 3 Feature.5: wire this position into the rug-watcher.
     // Only active in live mode (paper positions have no dev to watch).

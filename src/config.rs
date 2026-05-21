@@ -53,6 +53,12 @@ pub struct CopyTraderConfigSection {
     #[serde(default = "default_copy_hype_gate_mode")] pub hype_gate_mode: String,
     /// 14 finalist wallets. See `memory/wallet-validated.md`.
     #[serde(default)] pub targets: Vec<TargetWalletCfg>,
+    /// 🎯 INITIAL BACKLOG SUPPRESSION (2026-05-20): when false (default), the
+    /// first poll per target marks all returned signatures as "seen" WITHOUT
+    /// emitting buy/sell signals. Those are historical trades from before
+    /// the bot started — not fresh opportunities. Only trades discovered
+    /// AFTER startup will be routed. Set to true only for backfill/replay.
+    #[serde(default)] pub emit_initial_backlog: bool,
 }
 
 fn default_copy_poll_interval() -> u64 { 7 }
