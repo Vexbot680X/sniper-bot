@@ -326,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn enrolls_and_fires_when_mcap_crosses_min() {
         let curves = CurveTracker::new();
-        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string());
+        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string(), None);
         let cfg = WatcherCfg { min_mcap_usd: 50_000.0, max_mcap_usd: 70_000.0, ttl_secs: 60, max_candidates: 10 };
         let provider = Arc::new(StubSolUsd { px: 100.0 });
         let (watcher, mut rx) = McapWatcher::spawn(cfg, curves.clone(), dummy_sub, provider);
@@ -347,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_fire_below_min() {
         let curves = CurveTracker::new();
-        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string());
+        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string(), None);
         let cfg = WatcherCfg { min_mcap_usd: 50_000.0, max_mcap_usd: 70_000.0, ttl_secs: 60, max_candidates: 10 };
         let provider = Arc::new(StubSolUsd { px: 100.0 });
         let (watcher, mut rx) = McapWatcher::spawn(cfg, curves.clone(), dummy_sub, provider);
@@ -364,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn drops_candidate_past_max() {
         let curves = CurveTracker::new();
-        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string());
+        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string(), None);
         let cfg = WatcherCfg { min_mcap_usd: 50_000.0, max_mcap_usd: 70_000.0, ttl_secs: 60, max_candidates: 10 };
         let provider = Arc::new(StubSolUsd { px: 100.0 });
         let (watcher, mut rx) = McapWatcher::spawn(cfg, curves.clone(), dummy_sub, provider);
@@ -383,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn fires_only_once_per_candidate() {
         let curves = CurveTracker::new();
-        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string());
+        let dummy_sub = curves.clone().spawn("ws://test-ignored".to_string(), None);
         let cfg = WatcherCfg { min_mcap_usd: 50_000.0, max_mcap_usd: 70_000.0, ttl_secs: 60, max_candidates: 10 };
         let provider = Arc::new(StubSolUsd { px: 100.0 });
         let (watcher, mut rx) = McapWatcher::spawn(cfg, curves.clone(), dummy_sub, provider);

@@ -207,14 +207,19 @@ pub async fn run_with_opts(cfg: Config, opts: RunOpts) -> Result<()> {
     let cfg = Arc::new(cfg);
 
     // Build executor only in live mode. In paper mode it stays None.
+    // RPC is built ONCE up front. We need it everywhere now — not just
+    // live-mode execution — because curve-state learning reads the
+    // bonding-curve PDA directly via Helius (PumpPortal's WS trade stream
+    // got paywalled in 2026-05, see bonding_curve.rs docs).
+    let rpc = Rpc::from_env(&cfg.rpc.helius_endpoint)?;
+
     let executor: Option<Arc<Executor>> = if is_live(&cfg) {
         if is_halted() {
             error!("HALT flag present at {} — refusing to start in live mode. Delete the file to resume.", HALT_FLAG);
             tg.send(&format!("🛑 *START REFUSED* — HALT flag at `{}` is present. Delete to resume.", HALT_FLAG)).await.ok();
             anyhow::bail!("halt flag present");
         }
-        let rpc = Rpc::from_env(&cfg.rpc.helius_endpoint)?;
-        let ex = Arc::new(Executor::new(&cfg, rpc)?);
+        let ex = Arc::new(Executor::new(&cfg, rpc.clone())?);
         let trading_pk = ex.trading_kp.pubkey();
 
         // 🛡️ SAFETY (Phase 3.Safety.2): live-mode confirmation gate.
@@ -321,7 +326,13 @@ Wallet `{}`  cap `{} SOL`",
     };
 
     let curves = CurveTracker::new();
-    let curve_sub = curves.clone().spawn(cfg.rpc.pumpportal_ws.clone());
+    // Pass the shared RPC into the tracker so `subscribe()` can fetch the
+    // bonding-curve account directly on-chain (PumpPortal trade WS is
+    // paywalled — see bonding_curve.rs).
+    let curve_sub = curves.clone().spawn(
+        cfg.rpc.pumpportal_ws.clone(),
+        Some(rpc.client.clone()),
+    );
 
     // 2026-05-14: Mcap-progression watcher. When enabled, fresh launches at
     // seed price that would normally be rejected (low_mcap) get enrolled
@@ -1238,7 +1249,11 @@ async fn handle_new_token(
             }
         }
         match fetched {
-            Some(c) if c.v_sol > 0.0 && c.v_tokens > 0.0 => (c.v_sol, c.v_tokens),
+            Some(c) if c.v_sol > 0.0 && c.v_tokens > 0.0 => {
+                info!(mint=%tok.mint, v_sol=c.v_sol, v_tokens=c.v_tokens,
+                      "🟢 curve state learned");
+                (c.v_sol, c.v_tokens)
+            }
             _ => {
                 info!(mint=%tok.mint, filter="no_curve_state",
                       "🚧 copy-trade FILTER reason=no_curve_state_after_subscribe — no WS trade tick within 3s");
