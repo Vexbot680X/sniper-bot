@@ -626,7 +626,8 @@ mod copy_trade_config_tests {
 
         assert!(cfg.watchdog.enabled, "watchdog must be enabled");
         assert_eq!(cfg.watchdog.loss_cap_sol, -0.02);
-        assert_eq!(cfg.watchdog.session_duration_secs, 7200);
+        // 🕒 Mamba bumped to 28800 (8h overnight) on 2026-05-21 — keep test in sync.
+        assert_eq!(cfg.watchdog.session_duration_secs, 28800);
         assert_eq!(cfg.watchdog.trade_count_cap, 20);
         assert_eq!(cfg.watchdog.on_trip_action, "hold");
         assert!((cfg.watchdog.max_session_deploy_sol - 0.06).abs() < 1e-9);

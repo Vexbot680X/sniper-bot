@@ -163,7 +163,7 @@ impl CopyTraderCfg {
             error!("copy_trader.enabled=true but HELIUS_API_KEY env var is empty — skipping");
             return None;
         }
-        let targets = cc
+        let targets: Vec<TargetWallet> = cc
             .targets
             .iter()
             .map(|t| TargetWallet {
@@ -172,14 +172,28 @@ impl CopyTraderCfg {
                 weight: if t.weight > 0.0 { t.weight } else { 1.0 },
             })
             .collect();
+        // 🚨 SIGNAL FLOOD FIX (2026-05-21): the dedup ring is shared across ALL
+        // targets and ALL polls. If `cap < targets.len() * fetch_limit`, a
+        // single poll cycle is enough to evict the oldest signatures, and the
+        // next cycle will re-emit them as "new" — exact bug observed on the
+        // 13:52 UTC live run (15 wallets * fetch_limit=20 = 300 sigs/cycle, ring
+        // cap=256 → 7-8x amplification per signature).
+        //
+        // Floor it to `targets * fetch_limit * 16` (16 cycles ≈ 2 min of headroom
+        // at the default 7s poll), with a hard floor of 64.
+        let fetch_limit_clamped: u64 = cc.fetch_limit.max(5).min(100);
+        let dedup_floor = targets.len()
+            .saturating_mul(fetch_limit_clamped as usize)
+            .saturating_mul(16);
+        let dedup_cap = cc.dedup_cap.max(64).max(dedup_floor);
         Some(Self {
             enabled: true,
             targets,
             helius_api_key: api_key,
             poll_interval_secs: cc.poll_interval_secs.max(2),
             min_copy_usd: cc.min_copy_usd,
-            fetch_limit: cc.fetch_limit.max(5).min(100),
-            dedup_cap: cc.dedup_cap.max(64),
+            fetch_limit: fetch_limit_clamped,
+            dedup_cap,
             sol_mint: "So11111111111111111111111111111111111111112".to_string(),
             usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             emit_initial_backlog: cc.emit_initial_backlog,
@@ -1464,5 +1478,192 @@ mod tests {
             "REGRESSION: RAYDIUM SWAP must still resolve (got {raydium_sells})");
         assert!(pump_amm_buys >= 1,
             "PUMP_AMM BUY in mixed fixture must resolve (got {pump_amm_buys})");
+    }
+
+    // 🚨 SIGNAL FLOOD FIX (2026-05-21): the live run on 13:52 UTC fired 379
+    // BUY signals for only 51 unique tx signatures — 7-8x amplification.
+    // Root cause: dedup ring `cap=256` was smaller than
+    // `targets.len() * fetch_limit = 15 * 20 = 300`, so each poll evicted the
+    // oldest signatures and the next poll re-emitted them as "new".
+    //
+    // The fix enforces a defensive floor in `CopyTraderCfg::from_config_and_env`
+    // of `targets.len() * fetch_limit * 16` (16 cycles of headroom). These
+    // tests pin that contract.
+
+    #[test]
+    fn dedup_cap_floor_scales_with_targets_and_fetch_limit() {
+        // Simulate the live config: 15 targets, fetch_limit=20, dedup_cap=256.
+        // The floor must rescue us — final cap must be >= targets*fetch_limit
+        // by a comfortable margin.
+        let targets: Vec<TargetWallet> = (0..15)
+            .map(|i| TargetWallet {
+                pubkey: format!("target{:02}", i),
+                label: format!("L{i}"),
+                weight: 1.0,
+            })
+            .collect();
+        let fetch_limit = 20usize;
+        let dedup_cap_input = 256usize;
+        let fetch_limit_clamped = fetch_limit.max(5).min(100);
+        let dedup_floor = targets.len()
+            .saturating_mul(fetch_limit_clamped)
+            .saturating_mul(16);
+        let effective = dedup_cap_input.max(64).max(dedup_floor);
+        assert!(
+            effective >= targets.len() * fetch_limit * 4,
+            "dedup cap must hold at least 4 polls of headroom (have {effective} for {} sigs/cycle)",
+            targets.len() * fetch_limit
+        );
+        // Concretely: 15 * 20 * 16 = 4800.
+        assert_eq!(effective, 4800);
+    }
+
+    /// 🔒 REGRESSION: under the live config (15 wallets, fetch_limit=20), every
+    /// signature must survive at least 4 polls of headroom in the dedup ring.
+    /// We simulate 4 consecutive polls each returning 300 distinct sigs and
+    /// verify the original 300 are STILL deduped on the 5th poll.
+    #[test]
+    fn dedup_ring_survives_4_polls_under_live_config() {
+        let targets_n = 15usize;
+        let fetch_limit = 20usize;
+        // Mirror the production floor calc.
+        let cap = (targets_n * fetch_limit * 16).max(64);
+        let ring = Arc::new(std::sync::Mutex::new(DedupRing::new(cap)));
+
+        // Poll 1: insert the "original" 300 sigs.
+        let originals: Vec<String> = (0..300).map(|i| format!("orig_sig_{i:04}")).collect();
+        {
+            let mut r = ring.lock().unwrap();
+            for s in &originals {
+                assert!(r.insert(s), "poll 1 must accept all originals");
+            }
+        }
+
+        // Polls 2..=4: each adds 300 more distinct sigs.
+        for poll in 2..=4 {
+            let mut r = ring.lock().unwrap();
+            for i in 0..300 {
+                let s = format!("poll{poll}_sig_{i:04}");
+                assert!(r.insert(&s), "poll {poll} sig {i} must be new");
+            }
+        }
+
+        // Poll 5: the originals must STILL dedup — we haven't overflowed.
+        let mut leaked = 0usize;
+        {
+            let mut r = ring.lock().unwrap();
+            for s in &originals {
+                if r.insert(s) {
+                    leaked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            leaked, 0,
+            "REGRESSION: dedup ring evicted {leaked}/300 originals after 4 polls of churn \
+             — signal-flood bug returns. Raise dedup floor."
+        );
+    }
+
+    /// 🔒 REGRESSION (signal-flood, 2026-05-21): replay every BUY/SELL signal
+    /// the parser produces from the cented PUMP_FUN fixture (10 txs, 9 SWAPs)
+    /// through the dedup ring TWICE — the second pass must produce ZERO
+    /// emissions. Pins the persistent-dedup contract end-to-end.
+    #[test]
+    fn replay_cented_fixture_emits_each_signal_exactly_once() {
+        let data = load_fixture("tests/fixtures/pump/cented_pump_fun.json");
+        let txs = iter_swap_txs(&data);
+        assert!(!txs.is_empty(), "fixture must have SWAP txs");
+
+        // Mirror prod cap math: 15 * 20 * 16 = 4800 — way above 9 txs.
+        let ring = Arc::new(std::sync::Mutex::new(DedupRing::new(4800)));
+
+        // First pass: each tx either parses as a buy XOR sell XOR neither.
+        // We emit at most ONE signal per signature.
+        let mut first_pass_emissions = 0usize;
+        for (tx, target) in &txs {
+            let is_new = {
+                let mut r = ring.lock().unwrap();
+                r.insert(&tx.signature)
+            };
+            if !is_new {
+                continue;
+            }
+            let buy = detect_buy(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0);
+            let sell = if buy.is_none() {
+                detect_sell(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0)
+            } else {
+                None
+            };
+            if buy.is_some() || sell.is_some() {
+                first_pass_emissions += 1;
+            }
+        }
+        assert!(
+            first_pass_emissions >= 3,
+            "first pass: expected ≥3 signal emissions from 9-swap fixture, got {first_pass_emissions}"
+        );
+        assert!(
+            first_pass_emissions <= txs.len(),
+            "first pass: must emit ≤1 signal per swap tx (got {first_pass_emissions} for {} swaps)",
+            txs.len()
+        );
+
+        // Second pass: ALL signatures must dedup — zero new emissions.
+        let mut second_pass_emissions = 0usize;
+        for (tx, target) in &txs {
+            let is_new = {
+                let mut r = ring.lock().unwrap();
+                r.insert(&tx.signature)
+            };
+            if !is_new {
+                continue;
+            }
+            let _ = (
+                detect_buy(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0),
+                detect_sell(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0),
+            );
+            second_pass_emissions += 1;
+        }
+        assert_eq!(
+            second_pass_emissions, 0,
+            "REGRESSION: dedup leaked {second_pass_emissions} sigs on replay — signal-flood bug returns."
+        );
+    }
+
+    /// 🔒 detect_buy returns AT MOST one Option per call — the signature is
+    /// `Option<DetectedBuy>` not `Vec<DetectedBuy>`, so the type system
+    /// already prevents "emit N times per tx". This test pins that contract
+    /// against a real PUMP_FUN tx — if someone ever changes the signature
+    /// to return a Vec, they'll have to update this test too.
+    #[test]
+    fn detect_buy_returns_single_signal_per_tx() {
+        let data = load_fixture("tests/fixtures/pump/theo_pump_fun.json");
+        let txs = iter_swap_txs(&data);
+        for (tx, target) in &txs {
+            // Type-system check: the return is Option, not Vec.
+            let result: Option<DetectedBuy> =
+                detect_buy(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0);
+            // Smoke: if some, mint+size are sane.
+            if let Some(buy) = result {
+                assert!(!buy.mint.is_empty());
+                assert!(buy.his_size_usd >= 0.0);
+            }
+        }
+    }
+
+    /// Mirror for sell side.
+    #[test]
+    fn detect_sell_returns_single_signal_per_tx() {
+        let data = load_fixture("tests/fixtures/pump/cented_pump_fun.json");
+        let txs = iter_swap_txs(&data);
+        for (tx, target) in &txs {
+            let result: Option<DetectedSell> =
+                detect_sell(tx, target, SOL_MINT_T, USDC_MINT_T, 90.0);
+            if let Some(sell) = result {
+                assert!(!sell.mint.is_empty());
+                assert!(sell.his_size_usd >= 0.0);
+            }
+        }
     }
 }

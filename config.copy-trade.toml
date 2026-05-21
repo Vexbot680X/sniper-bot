@@ -254,7 +254,11 @@ enabled = true
 poll_interval_secs = 7
 min_copy_usd = 10.0    # patched 2026-05-20 19:46 UTC — was 200 (Vex default), too high for our wallet mix
 fetch_limit = 20         # last N txs per poll per wallet
-dedup_cap = 256
+# 🚨 SIGNAL FLOOD FIX (2026-05-21): ring is shared across ALL targets. With
+# 15 wallets * 20 fetch_limit = 300 sigs/cycle, the old 256 cap overflowed
+# every poll and re-emitted evicted sigs as "new" (7-8x amplification).
+# Code also enforces a floor of `targets * fetch_limit * 16` defensively.
+dedup_cap = 8192
 
 # 🧠 HYPE GATE (v1, observe-only): on every BUY signal we call
 # hype::get_hype_score(mint) with a 200ms timeout. In "observe" mode the
@@ -351,7 +355,7 @@ weight = 1.0
 [watchdog]
 enabled = true
 loss_cap_sol = -0.02              # trip when realized PnL drops below this
-session_duration_secs = 7200      # 2h session window
+session_duration_secs = 28800     # 8h session window (overnight run, 2026-05-21 by Mamba's request; deploy/loss/trade caps unchanged)
 trade_count_cap = 20              # trip after 20 executed buys
 max_session_deploy_sol = 0.06     # trip when cumulative deploy exceeds this
 on_trip_action = "hold"           # 'hold' = stop new buys, keep open positions
