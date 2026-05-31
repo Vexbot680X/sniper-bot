@@ -107,8 +107,10 @@ def get_new_txs(wallet, since_sig):
 
 
 MIN_SOL_SIZE = 0.05  # ignore dust trades below this
-MIN_TREASURY_OUT = 0.5  # SOL outflow threshold to flag treasury activity
-MIN_WASH_SELL_SOL = 1.0  # SOL received threshold to flag wash-wallet selling
+MIN_TREASURY_OUT = 10.0  # SOL outflow threshold to flag treasury activity (Mamba 05-31: only big moves)
+MIN_WASH_SELL_SOL = 10.0  # SOL received threshold to flag wash-wallet selling (Mamba 05-31)
+CONSENSUS_REQUIRED = 2  # number of distinct team-fleet wallets that must buy same mint within window to fire LOUD alert
+CONSENSUS_WINDOW = 600  # seconds
 STABLES = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
@@ -437,13 +439,20 @@ def main():
                                 continue
                             state["seen_buys"] = (state.get("seen_buys", []) + [key])[-500:]
                             now2 = time.time()
-                            recent_buys = [(m, w2, t) for (m, w2, t) in recent_buys if now2 - t < 600]
-                            other_hits = [WALLET_LABELS[w2] for (m, w2, t) in recent_buys
-                                          if m == b["mint"] and w2 != wallet and w2 in WALLET_LABELS]
+                            recent_buys = [(m, w2, t) for (m, w2, t) in recent_buys if now2 - t < CONSENSUS_WINDOW]
+                            other_wallets = sorted({w2 for (m, w2, t) in recent_buys
+                                                    if m == b["mint"] and w2 != wallet})
+                            other_hits = [WALLET_LABELS.get(w2, w2[:12]) for w2 in other_wallets]
                             recent_buys.append((b["mint"], wallet, b["ts"]))
-                            msg = fmt_buy(wallet, label, b, other_hits)
-                            print(msg, flush=True)
-                            telegram(msg)
+                            # CONSENSUS GATE: count distinct wallet addresses, not labels (multiple burners share a label)
+                            distinct_hits = 1 + len(other_wallets)
+                            if distinct_hits >= CONSENSUS_REQUIRED:
+                                msg = fmt_buy(wallet, label, b, other_hits)
+                                print(msg, flush=True)
+                                telegram(msg)
+                            else:
+                                # log quietly, no telegram
+                                print(f"\U0001f441\ufe0f single team-touch (no consensus): {label} {wallet[:12]} -> {b['mint']} {b['sol_spent']:.3f} SOL (no telegram)", flush=True)
                     # ---- Sell detection (wash wind-down / exit signal) ----
                     if mode in ("wash", "sells", "buys+wash", "all"):
                         sells = extract_sells(tx, wallet)
