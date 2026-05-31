@@ -1,0 +1,12 @@
+{
+  "wallet": "44U32ELj41BQhdyPm84qV7UTenysxKDYFb2zLLYnP2EH",
+  "role": "Orchestrator/launchpad",
+  "stats_2026-05-29": {
+    "total_create_events": 327,
+    "distinct_mints_touched": 341,
+    "date_range": "2026-03-05 to 2026-05-28 (84 days)",
+    "avg_launches_per_day": 3.892857142857143,
+    "recent_alive_pct": "10% (1/10 spot-checked)",
+    "pattern": "Batched launches, often 3-15 tokens in a single minute. Most die pre-grad. Shotgun strategy."
+  }
+}

@@ -195,6 +195,7 @@ mod tests {
             trade_count_cap: 20,
             on_trip_action: "hold".into(),
             max_session_deploy_sol: 0.06,
+            daily_floor_usd: 0.0,
         }
     }
 

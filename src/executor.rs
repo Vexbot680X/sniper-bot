@@ -655,6 +655,11 @@ impl Executor {
             if *delay > 0 {
                 tokio::time::sleep(Duration::from_millis(*delay)).await;
             }
+            // 2026-05-22: Try "auto" first. If pump.fun simulator rejects with
+            // Custom(6005) ("too much sol required" / "slippage exceeded" on
+            // graduated tokens), retry once with "pump-amm" to force PumpSwap
+            // routing. Captures graduated-token Theo plays we were missing.
+            let pool_for_attempt: &str = if attempt == 0 { "auto" } else { "pump-amm" };
             let attempt_res: Result<Signature> = async {
                 let signed_tx = crate::pumpportal_trade::build_signed_trade_tx(
                     &self.trading_kp,
@@ -664,7 +669,7 @@ impl Executor {
                     /* denominated_in_sol */ true,
                     slippage_pct,
                     priority_fee_sol,
-                    "auto",
+                    pool_for_attempt,
                 ).await.context("pumpportal build buy tx")?;
                 self.send_versioned_tx(&signed_tx).await
             }.await;
@@ -672,8 +677,11 @@ impl Executor {
                 Ok(s) => { sig_opt = Some(s); break; }
                 Err(e) => {
                     let msg = format!("{e}");
-                    let retriable = is_retriable_buy_error(&msg);
-                    warn!(attempt = attempt + 1, %mint, retriable, error = %msg, "buy attempt failed");
+                    // Custom(6005) on graduated tokens is non-retriable in is_retriable_buy_error
+                    // but we want to retry once with pump-amm. Force retriable for that case.
+                    let is_grad_error = msg.contains("Custom(6005)");
+                    let retriable = is_retriable_buy_error(&msg) || is_grad_error;
+                    warn!(attempt = attempt + 1, pool = pool_for_attempt, %mint, retriable, error = %msg, "buy attempt failed");
                     last_err = Some(anyhow!("pumpportal buy: {msg}"));
                     if !retriable { break; }
                 }

@@ -1,0 +1,97 @@
+{
+  "sol_usd": 82.435,
+  "min_buy_sol": 5.0,
+  "lookback_days": 14,
+  "results": [
+    {
+      "wallet": "6Xo6FUK8PZcczgLSjyPKtSdnYzXVLtRjhpMEM5qrKYRD",
+      "bal_sol": 1013.583070966,
+      "big_buys": {
+        "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B": {
+          "sol": 401.499,
+          "n": 1112,
+          "first": 1780092986,
+          "last": 1780181028
+        }
+      },
+      "big_sells": {
+        "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B": {
+          "sol": 746.198,
+          "n": 296,
+          "first": 1780093807,
+          "last": 1780180493
+        }
+      }
+    },
+    {
+      "wallet": "AwyWtzDuZ1AUCqdrozocTWBtPFVc7mVFB98i5DKj4Lgh",
+      "bal_sol": 1149.610732136,
+      "big_buys": {
+        "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B": {
+          "sol": 360.434,
+          "n": 635,
+          "first": 1779924312,
+          "last": 1780178211
+        }
+      },
+      "big_sells": {
+        "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B": {
+          "sol": 2475.155,
+          "n": 839,
+          "first": 1779924309,
+          "last": 1780181026
+        }
+      }
+    },
+    {
+      "wallet": "3k8M1Q1m94NgXQ9R9dumDXm15ChzY4bjBGmxL7LuL9Ua",
+      "bal_sol": 2.544254979,
+      "big_buys": {
+        "2PbhtFsuJeK3xL9XHYc2vcoDuD9DK6oD2X7ksRvEpump": {
+          "sol": 9.943,
+          "n": 5,
+          "first": 1779922463,
+          "last": 1779922717
+        },
+        "DtbwH6VyLFTvEEuH4AXN2haXEj1dA6DhnMtCKK32pump": {
+          "sol": 5.002,
+          "n": 4,
+          "first": 1779667131,
+          "last": 1779667249
+        }
+      },
+      "big_sells": {
+        "3c1LSB3Tydbb3Cf9hisLPnk1hxsGjKsgw1mFZ8Hdpump": {
+          "sol": 5.474,
+          "n": 1,
+          "first": 1779916045,
+          "last": 1779916045
+        }
+      }
+    },
+    {
+      "wallet": "4AV2Qzp3N4c9RfzyEbNZs2wqWfW4EwKnnxFAZCndvfGh",
+      "bal_sol": 8300.080339681,
+      "big_buys": {},
+      "big_sells": {}
+    },
+    {
+      "wallet": "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
+      "bal_sol": 1934.264701486,
+      "big_buys": {},
+      "big_sells": {}
+    },
+    {
+      "wallet": "5uAfF5jWBb39PJfZEEDAFUHcHDBXXrrfmgcG2VroW1wg",
+      "bal_sol": 0.209838748,
+      "big_buys": {},
+      "big_sells": {}
+    },
+    {
+      "wallet": "4JMBYZvKTvExEcr7yJYEVRWsMjgunyFYNGYHYqQTqTbf",
+      "bal_sol": 102.337858114,
+      "big_buys": {},
+      "big_sells": {}
+    }
+  ]
+}

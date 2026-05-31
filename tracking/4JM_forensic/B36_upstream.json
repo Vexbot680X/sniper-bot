@@ -1,0 +1,20 @@
+[
+  {
+    "hop": 0,
+    "to": "B36PdcUC1kXhHFUkJpDfUVx1K5q64fSxEez9Tx19GxmF",
+    "from": "2BnG7cXAm9MPg49BLqjaVdE9ychuTgzAx291H8gQWJ4E",
+    "amt": 0.576874452,
+    "ts": 1770179124,
+    "sig": "3hYkropk2UyXmbbq29v1E92FGH3P3V1qB8r6bgAV4BkpuEVDLXhPLvFYUuHtTfLdxVExJR6tPedzEVjoRtjhDM95",
+    "label": ""
+  },
+  {
+    "hop": 1,
+    "to": "2BnG7cXAm9MPg49BLqjaVdE9ychuTgzAx291H8gQWJ4E",
+    "from": "B36PdcUC1kXhHFUkJpDfUVx1K5q64fSxEez9Tx19GxmF",
+    "amt": 0.005510205,
+    "ts": 1770178842,
+    "sig": "2TXggvRiNQ5v3sfS4rqTEaUiY97mKeULnZrPRCuG16Y6kjKx7Ttn5eXUWqSbaEwNHpKjN14sPnXNCnWGHReBkDNY",
+    "label": "\ud83d\udc64 Mule (USA250 burner funder)"
+  }
+]

@@ -13,7 +13,8 @@
 #   Hype gate:       observe-only (logs PASS/FAIL, never blocks v1)
 # ----------------------------------------------------------------------------
 [trading]
-mode = "live"                    # paper | live  — LIVE 2026-05-12 14:44 UTC by Mamba. ⚠️ COPY-TRADE V1: requires --confirm-live to actually run live. DO NOT START without Mamba approval.
+mode = "live"                    # 🔴 LIVE 2026-05-22 12:30 UTC by Mamba — Theo-only, 0.2 SOL/trade, watchdog -0.3 SOL loss cap
+copy_trade_only = true           # 🚫 2026-05-22 14:48 UTC — Mamba: COPY-TRADE ONLY. Reject all sniper/scanner/mcap-watcher/trending-poller auto-entries.
 # Live execution requires SNIPER_WALLET_PATH (default ~/.openclaw/workspace/secrets/sniper-bot-wallet.json)
 # and VAULT_WALLET_PATH (default ~/.openclaw/workspace/secrets/vault-wallet.json) plus HELIUS_API_KEY env vars.
 # DO NOT flip to live without reviewing LIVE_BUILD_REPORT.md and dust-testing first.
@@ -42,20 +43,20 @@ max_curve_age_ms = 1500
 #   stop_loss_pct     = 10.0
 #   max_concurrent    = 3      → 0.06 SOL deployed on 0.1 SOL bankroll
 #   max_hold_seconds  = 0      → no timeout (exit only on TP / SL / source-sell)
-position_size_sol = 0.02         # 🔒 v1 locked — min entry
+position_size_sol = 0.15         # 🔧 2026-05-22 17:12 Mamba: 0.1 → 0.15. Mid-step between safe (0.1) and Theo-median (0.2). ~\$13/trade.
 position_size_pct = 0.0         # legacy %-of-bankroll, disabled when position_size_sol > 0
 
 # 🛑 LIVE-MODE HARD CAP (SOL). Independent belt-and-suspenders ceiling.
 # The bot refuses any LIVE buy that would exceed this many SOL, regardless of
 # what position_size_sol or any other math says. Paper mode ignores this.
-live_max_position_sol = 0.02     # 🔒 v1 locked — caps each mirror at 0.02 SOL
-take_profit_pct = 30.0           # 🔒 v1 locked
-stop_loss_pct = 10.0             # 🔒 v1 locked
+live_max_position_sol = 0.15  # 🔧 2026-05-22 17:12 — paired with position_size_sol
+take_profit_pct = 50.0           # 🔧 2026-05-22 17:22 Mamba: +30 → +50. Give Theo's moves more room before we cap upside.
+stop_loss_pct = 200.0            # 🔧 2026-05-22 17:50 Mamba: SL REMOVED. Formula is entry*(1 - sl_pct/100) so 200 → entry*(-1) = unreachable negative price. Effectively disabled. Exit only on +50% TP / source-sell / rug (mcap<\$2500 after 5s grace).
 max_concurrent_positions = 3     # 🔒 v1 locked — 3 slots × 0.02 SOL = 0.06 SOL of 0.1 SOL bankroll
 max_hold_seconds = 0             # 🔒 v1 locked — 0 = NO TIMEOUT (exit only on TP/SL/source-sell)
 # Rug exit: if open position's mcap collapses below this, force-close.
 # USD-denominated takes precedence when > 0; bot converts to SOL at decision time.
-rug_exit_mcap_usd = 7500.0       # v2 Mamba spec — fire fast on dump
+rug_exit_mcap_usd = 2500.0       # 🔧 2026-05-22 15:42 Mamba: lowered 7500→2500. Pump.fun coins launch at $3-4k mcap; $7500 floor force-exited copy-trades instantly. $2500 = true rug threshold (curve drained below launch). NOTE: rug-watcher in daemon also has a >=5s grace period after entry to avoid insta-exits.
 rug_exit_mcap_sol = 0.0         # legacy SOL floor, disabled when rug_exit_mcap_usd > 0
 
 # 🛡️ SAFETY (Phase 3.Safety.1): book↔chain reconciliation guard.
@@ -69,8 +70,8 @@ reconciliation_tolerance_pct = 0.05    # 5%
 # Estimates the slippage of selling our position back into the CURRENT
 # curve depth (worst-realistic-exit model). Refuses entries where the
 # estimate exceeds the threshold. Closes the JOHNPORK-style failure.
-pre_buy_slippage_required = true
-pre_buy_slippage_threshold_pct = 0.10  # 10% — refuse if estimated >= this
+pre_buy_slippage_required = false      # 🔧 2026-05-22 Mamba: disabled for copy-trade. Theo enters at whatever curve depth; we mirror at slightly worse depth. Refusing on slippage misses every real signal.
+pre_buy_slippage_threshold_pct = 0.10  # legacy — ignored when pre_buy_slippage_required=false
 pre_buy_fee_bps_per_side = 100         # pump.fun documented swap fee
 
 # 🛡️ FEATURE (Phase 3.Feature.2): scale-out exits.
@@ -190,7 +191,7 @@ enabled = true
 # band. This is how we catch coins like Singularity that launch at $3k and
 # rocket to $16k+ (which our normal new-token stream misses).
 [mcap_watcher]
-enabled = true                    # 🐍 MAMBA-7K 2026-05-18 — CATCH CLIMBERS
+enabled = false                   # 🚫 2026-05-22 — disabled by Mamba. COPY-TRADE ONLY — no sniper/climber routes.
 ttl_secs = 900                    # 🐍 15min — climbers pump fast or not at all
 max_candidates = 1500             # 🐍 bumped from 500 — was hitting cap
 
@@ -200,7 +201,7 @@ max_candidates = 1500             # 🐍 bumped from 500 — was hitting cap
 # that the WS new-token subscription missed. This is what catches "Sunny"-style
 # coins that pumped in our band before the bot started watching.
 [trending_poller]
-enabled = true
+enabled = false                   # 🚫 2026-05-22 — disabled by Mamba. COPY-TRADE ONLY.
 poll_interval_secs = 30
 min_mcap_usd = 15000.0
 max_mcap_usd = 200000.0
@@ -219,7 +220,7 @@ max_last_trade_age_secs = 10    # 🐍 tightened — only truly active coins
 # buy/sell tx counts before letting bot enter. Catches "zombies" that look
 # active via pump.fun's last_trade_timestamp but have $0 actual movement.
 [volume_verifier]
-enabled = true
+enabled = false                   # 🚫 2026-05-22 — only relevant for sniper path. COPY-TRADE ONLY.
 min_vol_5m_usd = 1000.0           # v2 Mamba spec
 min_txns_5m = 15                  # 🐍 loosened slightly
 min_buy_sell_ratio = 1.05         # 🐍 lowered 1.2→1.05 (would have caught August)
@@ -251,8 +252,8 @@ log_dir = "logs"
 # the filter on HIS size (skip his dust); our own size is independent.
 [copy_trader]
 enabled = true
-poll_interval_secs = 7
-min_copy_usd = 10.0    # patched 2026-05-20 19:46 UTC — was 200 (Vex default), too high for our wallet mix
+poll_interval_secs = 2                # 🚀 2026-05-22 16:20 Mamba: Helius Business plan unlocks high-RPS polling. Dropped 7s→2s. Cuts copy-trade latency from ~7s avg to ~2s avg. Cost: 3 targets × (60/2) = 90 RPM to Helius, well within Business limits.
+min_copy_usd = 20.0    # 2026-05-22 — Theo-only mode. His median buy is ~$23; filter out his sub-dust probes. Raise to 50+ to catch only conviction plays.
 fetch_limit = 20         # last N txs per poll per wallet
 # 🚨 SIGNAL FLOOD FIX (2026-05-21): ring is shared across ALL targets. With
 # 15 wallets * 20 fetch_limit = 300 sigs/cycle, the old 256 cap overflowed
@@ -273,78 +274,89 @@ hype_gate_mode = "observe"  # "observe" | "enforce"
 # All start at weight = 1.0; phase 4 will down-weight underperformers.
 # Source legend in [Notes]: kolexplorer / kolscan / both.
 
-[[copy_trader.targets]]  # #1 — 517.23 SOL realized, 87.8% win, 161 trades
-pubkey = "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm"
-label  = "Gake"
-weight = 1.0
+# ⚡ THREE-WALLET MODE (locked 2026-05-22 13:07 UTC by Mamba)
+# Theo (anchor) + Daumen + Jijo. Diverse signal sources, all on-chain-balance-vetted.
 
-[[copy_trader.targets]]  # #2 — 341.76 SOL, 44.3% win, 1442 trades
-pubkey = "6S8GezkxYUfZy9JPtYnanbcZTMB87Wjt1qx3c6ELajKC"
-label  = "Nyhrox"
-weight = 1.0
-
-[[copy_trader.targets]]  # #3 — 323.13 SOL, 48.9% win, 1410 trades
-pubkey = "8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5"
-label  = "Daumen"
-weight = 1.0
-
-[[copy_trader.targets]]  # #4 — 305.63 SOL, 63.8% win, 1101 trades
-pubkey = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"
-label  = "Jijo"
-weight = 1.0
-
-[[copy_trader.targets]]  # #5 — 262.81 SOL, 40.9% win, 1673 trades
-pubkey = "87rRdssFiTJKY4MGARa4G5vQ31hmR7MxSmhzeaJ5AAxJ"
-label  = "Dior"
-weight = 1.0
-
-[[copy_trader.targets]]  # #6 — 248.66 SOL, 45.5% win, 1447 trades
-pubkey = "FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke"
-label  = "Radiance"
-weight = 1.0
-
-[[copy_trader.targets]]  # #7 — 228.61 SOL, 87.7% win, 787 trades
-pubkey = "6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd"
-label  = "Slingoor"
-weight = 1.0
-
-[[copy_trader.targets]]  # #8 — 201.94 SOL, 30.9% win, 1227 trades
-pubkey = "2net6etAtTe3Rbq2gKECmQwnzcKVXRaLcHy2Zy1iCiWz"
-label  = "Rambo"
-weight = 1.0
-
-# #9 Brox — DROPPED 2026-05-20 by Mamba per sub-agent task (14 finalists, not 15).
-# Was: pubkey = "7VBTpiiEjkwRbRGHJFUz6o5fWuhPFtAmy8JGhNqwHNnn"  label = "Brox"
-
-[[copy_trader.targets]]  # #10 — 153.96 SOL, 43.2% win, 1426 trades
+[[copy_trader.targets]]  # #10 — 153.96 SOL, 43.2% win, 1426 trades, wallet $136k
 pubkey = "Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt"
 label  = "Theo"
 weight = 1.0
 
-[[copy_trader.targets]]  # #11 — 144.10 SOL, 55.0% win, 582 trades
-pubkey = "57rXqaQsvgyBKwebP2StfqQeCBjBS4jsrZFJN5aU2V9b"
-label  = "Ram"
+[[copy_trader.targets]]  # #3 Daumen — 323.13 SOL, 48.9% win, 1410 trades, wallet $31k
+pubkey = "8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5"
+label  = "Daumen"
 weight = 1.0
 
-[[copy_trader.targets]]  # #12 — 111.53 SOL, 47.4% win, 828 trades
-pubkey = "9iaawVBEsFG35PSwd4PahwT8fYNQe9XYuRdWm872dUqY"
-label  = "Meechie"
+[[copy_trader.targets]]  # #4 Jijo — 305.63 SOL, 63.8% win, 1101 trades, wallet $29k
+pubkey = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"
+label  = "Jijo"
 weight = 1.0
 
-[[copy_trader.targets]]  # #13 — 110.56 SOL, 46.4% win, 1289 trades
-pubkey = "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt"
-label  = "Kay The Doc"
-weight = 1.0
+# --- DISABLED 2026-05-22 (Theo-only mode) ---
+# [[copy_trader.targets]]  # #1 — Gake — 517.23 SOL realized, 87.8% win, 161 trades
+# pubkey = "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm"
+# label  = "Gake"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #2 — Nyhrox — 341.76 SOL, 44.3% win, 1442 trades
+# pubkey = "6S8GezkxYUfZy9JPtYnanbcZTMB87Wjt1qx3c6ELajKC"
+# label  = "Nyhrox"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #3 — Daumen — 323.13 SOL, 48.9% win, 1410 trades
+# pubkey = "8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5"
+# label  = "Daumen"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #4 — Jijo — 305.63 SOL, 63.8% win, 1101 trades
+# pubkey = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"
+# label  = "Jijo"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #5 — Dior — 262.81 SOL, 40.9% win, 1673 trades
+# pubkey = "87rRdssFiTJKY4MGARa4G5vQ31hmR7MxSmhzeaJ5AAxJ"
+# label  = "Dior"
+# weight = 1.0
+#
+# 🚫 Radiance — PERMANENTLY REMOVED 2026-05-22 by Mamba.
+# Wallet only $886 — doesn't pass the "real player" filter (Theo $136k, Gake $6k for comparison).
+# Was: pubkey = "FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke"  label = "Radiance"
 
-[[copy_trader.targets]]  # #14 — 96.47 SOL, 45.7% win, 1460 trades
-pubkey = "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o"
-label  = "Cented"
-weight = 1.0
+#
+# [[copy_trader.targets]]  # #7 — Slingoor — 228.61 SOL, 87.7% win, 787 trades
+# pubkey = "6mWEJG9LoRdto8TwTdZxmnJpkXpTsEerizcGiCNZvzXd"
+# label  = "Slingoor"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #8 — Rambo — 201.94 SOL, 30.9% win, 1227 trades
+# pubkey = "2net6etAtTe3Rbq2gKECmQwnzcKVXRaLcHy2Zy1iCiWz"
+# label  = "Rambo"
+# weight = 1.0
+#
+# #9 Brox — DROPPED 2026-05-20 by Mamba (14 finalists, not 15).
+#
+# 🚫 Ram — PERMANENTLY REMOVED 2026-05-22 by Mamba.
+# Wallet only $228 — historical 55% WR on $144k cumulative is on dust trades, not copyable conviction.
+# Was: pubkey = "57rXqaQsvgyBKwebP2StfqQeCBjBS4jsrZFJN5aU2V9b"  label = "Ram"
 
-[[copy_trader.targets]]  # #15 — 88.01 SOL, 32.7% win, 1168 trades
-pubkey = "831yhv67QpKqLBJjbmw2xoDUeeFHGUx8RnuRj9imeoEs"
-label  = "Trey"
-weight = 1.0
+# 🚫 Meechie — PERMANENTLY REMOVED 2026-05-22 by Mamba.
+# Wallet essentially empty ($0.78) — likely rugged himself or quit. Do not re-enable.
+# Was: pubkey = "9iaawVBEsFG35PSwd4PahwT8fYNQe9XYuRdWm872dUqY"  label = "Meechie"
+#
+# [[copy_trader.targets]]  # #13 — Kay The Doc — 110.56 SOL, 46.4% win, 1289 trades
+# pubkey = "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt"
+# label  = "Kay The Doc"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #14 — Cented — 96.47 SOL, 45.7% win, 1460 trades — DO-NOT-COPY (wash-trade honeypot per COPY_TRADE_TARGETS.md)
+# pubkey = "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o"
+# label  = "Cented"
+# weight = 1.0
+#
+# [[copy_trader.targets]]  # #15 — Trey — 88.01 SOL, 32.7% win, 1168 trades
+# pubkey = "831yhv67QpKqLBJjbmw2xoDUeeFHGUx8RnuRj9imeoEs"
+# label  = "Trey"
+# weight = 1.0
 
 # ============================================================================
 # 🛡️ WATCHDOG — session-level circuit breaker (2026-05-20)
@@ -354,8 +366,9 @@ weight = 1.0
 # buys (HALT). Open positions are NOT force-closed (v1 default 'hold').
 [watchdog]
 enabled = true
-loss_cap_sol = -0.02              # trip when realized PnL drops below this
-session_duration_secs = 28800     # 8h session window (overnight run, 2026-05-21 by Mamba's request; deploy/loss/trade caps unchanged)
-trade_count_cap = 20              # trip after 20 executed buys
-max_session_deploy_sol = 0.06     # trip when cumulative deploy exceeds this
+loss_cap_sol = -0.145             # 🔒 2026-05-22 15:45 Mamba: HARD FLOOR $100 bankroll. Anchor $112.66 - $12.66 max loss = $100 floor. At ~$87/SOL, $12.66 = 0.145 SOL. Bot HALTS new buys when realized PnL drops below this (current realized -$4.91, ~$7.66 of room left).
+session_duration_secs = 28800     # 8h session window
+trade_count_cap = 20              # trip after 20 executed buys (unchanged)
+max_session_deploy_sol = 2.0      # 🔧 2026-05-22 18:39 Mamba: raised 0.6→2.0. Was limiting WINNING sessions — we hit cap at 4 trades when up \$15. Loss cap (-0.145 SOL) still protects from actual bleed.
 on_trip_action = "hold"           # 'hold' = stop new buys, keep open positions
+daily_floor_usd = 70.0            # 🔒 2026-05-22 18:24 Mamba: PERSISTENT DAILY FLOOR. Bot REFUSES TO START if (trading+vault) < \$70 total. Survives restarts; can't be bypassed by reset. Currently at ~\$84 → \$14 of runway before hard daily stop.

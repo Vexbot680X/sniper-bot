@@ -53,6 +53,12 @@ const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 /// Returns `Err` if the BC account does not exist (pre-launch race window),
 /// is too small (corrupt / wrong program), or the RPC call fails. Callers
 /// should treat any error as "can't price — skip entry."
+///
+/// 2026-05-22 (Nexus): when the bonding-curve PDA exists but reserves are
+/// zero (= token has graduated to PumpSwap AMM), fall back to Dexscreener
+/// to fetch the pool's liquidity.quote (SOL) and liquidity.base (tokens),
+/// which substitute cleanly for v_sol/v_tokens for pricing purposes. The
+/// executor's PumpPortal `pool: "auto"` route handles the actual swap.
 pub async fn fetch_curve_state_onchain(
     rpc: &RpcClient,
     mint: &str,
@@ -74,13 +80,73 @@ pub async fn fetch_curve_state_onchain(
         acct.data[BC_VSOL_OFFSET..BC_VSOL_OFFSET+8].try_into().unwrap()
     );
     if v_token_raw == 0 || v_sol_raw == 0 {
-        return Err(anyhow!(
-            "bonding-curve reserves are zero for {mint} (v_token={}, v_sol={})",
-            v_token_raw, v_sol_raw
-        ));
+        // Graduated to PumpSwap — fall back to Dexscreener.
+        match fetch_pumpswap_reserves_dexscreener(mint).await {
+            Ok((v_sol_g, v_tokens_g)) => {
+                debug!(%mint, v_sol=v_sol_g, v_tokens=v_tokens_g,
+                       "🔄 curve state synthesized from PumpSwap pool (graduated)");
+                return Ok((v_sol_g, v_tokens_g));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "bonding-curve reserves zero for {mint} AND pumpswap fallback failed: {e}"
+                ));
+            }
+        }
     }
     let v_sol = v_sol_raw as f64 / LAMPORTS_PER_SOL_F64;
     let v_tokens = v_token_raw as f64 / TOKEN_DECIMALS_DIVISOR;
+    Ok((v_sol, v_tokens))
+}
+
+/// PumpSwap (graduated pump.fun token) reserves via Dexscreener.
+/// Returns `(v_sol, v_tokens)` in human units, so the result plugs directly
+/// into the existing `CurveState` math without further conversion.
+///
+/// We accept a small staleness window (Dexscreener updates every few seconds)
+/// in exchange for not having to hand-decode the PumpSwap pool account layout.
+/// 5-second timeout to keep entry latency bounded.
+async fn fetch_pumpswap_reserves_dexscreener(mint: &str) -> Result<(f64, f64)> {
+    let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", mint);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("build dexscreener client")?;
+    let resp = client.get(&url).send().await
+        .map_err(|e| anyhow!("dexscreener GET {mint}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(anyhow!("dexscreener http {} for {}", status, mint));
+    }
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow!("dexscreener json {mint}: {e}"))?;
+    let pairs = body.get("pairs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("dexscreener: no pairs array for {mint}"))?;
+    if pairs.is_empty() {
+        return Err(anyhow!("dexscreener: empty pairs for {mint} (token may be rugged)"));
+    }
+    // Prefer pumpswap; otherwise take the highest-liquidity pair.
+    let pair = pairs.iter()
+        .find(|p| p.get("dexId").and_then(|d| d.as_str()) == Some("pumpswap"))
+        .or_else(|| {
+            pairs.iter().max_by(|a, b| {
+                let la = a.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let lb = b.get("liquidity").and_then(|l| l.get("usd")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .ok_or_else(|| anyhow!("dexscreener: no usable pair for {mint}"))?;
+    let liq = pair.get("liquidity").ok_or_else(|| anyhow!("no liquidity field"))?;
+    let v_sol = liq.get("quote").and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("liquidity.quote missing"))?;
+    let v_tokens = liq.get("base").and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("liquidity.base missing"))?;
+    if v_sol <= 0.0 || v_tokens <= 0.0 {
+        return Err(anyhow!(
+            "dexscreener: graduated pool has zero reserves for {mint} (likely rugged)"
+        ));
+    }
     Ok((v_sol, v_tokens))
 }
 

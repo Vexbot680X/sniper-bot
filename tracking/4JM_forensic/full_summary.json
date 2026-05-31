@@ -1,0 +1,126 @@
+{
+  "wallet": "4JMBYZvKTvExEcr7yJYEVRWsMjgunyFYNGYHYqQTqTbf",
+  "total_sigs": 3549,
+  "first_tx_ts": 1771180522,
+  "last_tx_ts": 1779509061,
+  "mints_total": 9,
+  "mints_top20": [
+    [
+      "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B",
+      3534,
+      1778283805
+    ],
+    [
+      "So11111111111111111111111111111111111111112",
+      3533,
+      1779230138
+    ],
+    [
+      "7PLeKYANAgSmccGnVdsahtyrRGjCjLt3HvPnAz2eViKQ",
+      2,
+      1771180522
+    ],
+    [
+      "AS37LC9F8GguHfU6Z6owtJQUyo8XXCtKtwhoRZyRk6is",
+      2,
+      1771269778
+    ],
+    [
+      "Bpk6sAEZ4nrUc6eRhNyk9TuijnSVpcMD1oFqE5qRLz5e",
+      2,
+      1771272042
+    ],
+    [
+      "GjyrLCb76QfJZYDbgWm3y28oTrn8bu9iD2AzqXS9ufrb",
+      2,
+      1775767580
+    ],
+    [
+      "9LCpovHLT3Edp7VZPWCAND1bMwQtAz3TGhr1yEeKDpG3",
+      2,
+      1776382659
+    ],
+    [
+      "5FeT3xREx5736VFSe6LAXsa6L8DVSMZYvWhpUCKUUSAi",
+      2,
+      1776647710
+    ],
+    [
+      "q2eQu8AbsTpFYWjyqUB5gXhNhogB8Cu1iTEPYFpRTvx",
+      2,
+      1777231430
+    ]
+  ],
+  "programs": {
+    "METEORA_DAMM_V2": 3533,
+    "SOLANA_PROGRAM_LIBRARY": 15,
+    "SYSTEM_PROGRAM": 1
+  },
+  "types": {
+    "SWAP": 3533,
+    "TRANSFER": 10,
+    "BURN": 6
+  },
+  "funders_native_top": [
+    [
+      "FySBM8FsuTD2f8ZVnsVTWHwBmkqfgFma3XdYV3fZoX88",
+      110.22338867401828
+    ],
+    [
+      "B36PdcUC1kXhHFUkJpDfUVx1K5q64fSxEez9Tx19GxmF",
+      0.0084
+    ],
+    [
+      "CDryJYjzESZfDzFTpFn8fGXYzVmTyw1obHiShZuDacKH",
+      0.008
+    ],
+    [
+      "ESrg717vmk5vid8AMbBFvta6MWKcFYkdmWaMsuvanWEy",
+      0.003
+    ],
+    [
+      "GgHgAhvNZFFSm1K78YvMgQugBNyAACEZLyspWSRVxGE3",
+      0.003
+    ],
+    [
+      "17765NNuMaSFaQ5BLoakMQzvAmCb9aYktT9ozDTjy45",
+      0.003
+    ],
+    [
+      "9MxWYBaS8yswHJ9bkDDTbxsS2pxt3A5LaG586S58ewhF",
+      0.00203928
+    ],
+    [
+      "F9u6j8nJrbGKsBvYr3TGvb49CTXyiNC5JNXDwz5rZmRs",
+      0.00203928
+    ],
+    [
+      "7ApAmVuqfJxXDcUHcdiTuvBdSGGL6ApKywP4sWG8suNE",
+      0.00203928
+    ],
+    [
+      "55VE2ZzPrwqCft7irtPiPhKm4hddAgckciDZReGZM1gv",
+      0.00203928
+    ],
+    [
+      "323YR19ZtR1j4eSAWstKurkdftWuX8wohKtjB5MVjey5",
+      0.00203928
+    ],
+    [
+      "4Wksv8t1PhfwK47VqcrV9Eq7LhsP3DxT3ZxJGAyApjJ3",
+      0.00203928
+    ]
+  ],
+  "spent_to_top": [
+    [
+      "FySBM8FsuTD2f8ZVnsVTWHwBmkqfgFma3XdYV3fZoX88",
+      7.204776239999921
+    ]
+  ],
+  "first_funding": {
+    "ts": 1771180522,
+    "from": "B36PdcUC1kXhHFUkJpDfUVx1K5q64fSxEez9Tx19GxmF",
+    "amt": 0.005,
+    "sig": "MVwAa8zRFJGkf4FqTikgWeCFuxxJkVY5nKqkhhwSAKAbY8gRZbcDGmgzi14m1hRYU75mdAqCQfUDkQsjuMakvKt"
+  }
+}

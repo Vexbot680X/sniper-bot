@@ -290,6 +290,16 @@ Wallet `{}`  cap `{} SOL`",
                             tolerance_pct=%format!("{:.2}", tol*100.0),
                             "✅ reconciliation OK"
                         );
+                        // 🔒 2026-05-22 Mamba: daily-floor circuit breaker. Survives restarts.
+                        if cfg.watchdog.daily_floor_usd > 0.0 && chain_total_usd < cfg.watchdog.daily_floor_usd {
+                            let msg = format!(
+                                "DAILY FLOOR BREACHED — refuse start. Total ${:.2} < floor ${:.2}.",
+                                chain_total_usd, cfg.watchdog.daily_floor_usd
+                            );
+                            error!("🔴 START REFUSED — {}", msg);
+                            tg.send(&format!("🔴 *START REFUSED* — daily floor breached\nTotal: `${:.2}` < Floor: `${:.2}`\nWait for tomorrow.", chain_total_usd, cfg.watchdog.daily_floor_usd)).await.ok();
+                            anyhow::bail!(msg);
+                        }
                         tg.send(&format!(
                             "✅ *RECONCILIATION OK*\nChain: `${:.2}`  Books: `${:.2}`\nDivergence: `{:.2}%` (tol `{:.2}%`)",
                             chain_total_usd, book_total_usd, divergence*100.0, tol*100.0
@@ -517,6 +527,11 @@ Wallet `{}`  cap `{} SOL`",
 
     let mut new_tokens = pumpportal::spawn_listener(cfg.rpc.pumpportal_ws.clone());
 
+    // 🛡️ WATCHDOG — spawn before position-checker so callbacks can hook in.
+    // 2026-05-22: relocated from line ~853 to here so handle_new_token spawns
+    // (further down in this fn) can clone() it into their closures.
+    let watchdog: Watchdog = Watchdog::spawn(cfg.watchdog.clone(), tg.clone());
+
     // Position checker
     {
         let cfg = cfg.clone(); let db = db.clone(); let state = state.clone();
@@ -525,6 +540,7 @@ Wallet `{}`  cap `{} SOL`",
         let executor = executor.clone();
         let pending_dev_dump_exits = pending_dev_dump_exits.clone();
         let dev_watcher = dev_watcher.clone();
+        let watchdog_pc = watchdog.clone();
         tokio::spawn(async move {
             let interval = Duration::from_secs(cfg.scanner.position_check_interval_seconds);
             loop {
@@ -532,6 +548,7 @@ Wallet `{}`  cap `{} SOL`",
                 if let Err(e) = check_positions(
                     &cfg, &db, &state, &tg, &jup, &curves, &curve_sub, executor.as_ref(),
                     &pending_dev_dump_exits, dev_watcher.as_ref(),
+                    Some(&watchdog_pc),
                 ).await {
                     error!(error=?e, "position check failed");
                 }
@@ -547,6 +564,7 @@ Wallet `{}`  cap `{} SOL`",
         let executor = executor.clone();
         let pending_dev_dump_exits = pending_dev_dump_exits.clone();
         let dev_watcher = dev_watcher.clone();
+        let watchdog_sp = watchdog.clone();
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -604,6 +622,7 @@ Wallet `{}`  cap `{} SOL`",
                     if let Err(e) = check_positions(
                         &cfg, &db, &state, &tg, &jup, &curves, &curve_sub, executor.as_ref(),
                         &pending_dev_dump_exits, dev_watcher.as_ref(),
+                        Some(&watchdog_sp),
                     ).await {
                         warn!(error=?e, "post-poll position check failed");
                     }
@@ -699,6 +718,7 @@ Wallet `{}`  cap `{} SOL`",
         let executor_l = executor.clone();
         let dev_watcher_l = dev_watcher.clone();
         let mcap_watcher_l = mcap_watcher.clone();
+        let watchdog_l = watchdog.clone();
         tokio::spawn(async move {
             while let Some(sig) = rx.recv().await {
                 info!(
@@ -714,12 +734,14 @@ Wallet `{}`  cap `{} SOL`",
                 let executor = executor_l.clone();
                 let dev_watcher_clone = dev_watcher_l.clone();
                 let mcap_watcher_clone = mcap_watcher_l.clone();
+                let watchdog_clone = watchdog_l.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_new_token(
                         &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
                         &symbol_cache, executor.as_ref(),
                         dev_watcher_clone.as_ref(),
                         mcap_watcher_clone.as_ref(),
+                        Some(&watchdog_clone),
                         tok,
                     ).await {
                         warn!(error=?e, "handle_new_token (livestream route) failed");
@@ -740,6 +762,7 @@ Wallet `{}`  cap `{} SOL`",
         let executor_m = executor.clone();
         let dev_watcher_m = dev_watcher.clone();
         let mcap_watcher_m = mcap_watcher.clone();
+        let watchdog_m = watchdog.clone();
         tokio::spawn(async move {
             while let Some(sig) = rx.recv().await {
                 info!(
@@ -770,12 +793,14 @@ Wallet `{}`  cap `{} SOL`",
                 let executor = executor_m.clone();
                 let dev_watcher_clone = dev_watcher_m.clone();
                 let mcap_watcher_clone = mcap_watcher_m.clone();
+                let watchdog_clone = watchdog_m.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_new_token(
                         &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
                         &symbol_cache, executor.as_ref(),
                         dev_watcher_clone.as_ref(),
                         mcap_watcher_clone.as_ref(),
+                        Some(&watchdog_clone),
                         tok,
                     ).await {
                         warn!(error=?e, "handle_new_token (momentum route) failed");
@@ -797,6 +822,7 @@ Wallet `{}`  cap `{} SOL`",
         let executor_b = executor.clone();
         let dev_watcher_b = dev_watcher.clone();
         let mcap_watcher_b = mcap_watcher.clone();
+        let watchdog_b = watchdog.clone();
         tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 info!(mint=%ev.mint, symbol=%ev.symbol, mcap_usd=ev.mcap_usd, "📨 mcap band crossing — routing to entry path");
@@ -822,12 +848,14 @@ Wallet `{}`  cap `{} SOL`",
                 let executor = executor_b.clone();
                 let dev_watcher_clone = dev_watcher_b.clone();
                 let mcap_watcher_clone = mcap_watcher_b.clone();
+                let watchdog_clone = watchdog_b.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_new_token(
                         &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
                         &symbol_cache, executor.as_ref(),
                         dev_watcher_clone.as_ref(),
                         mcap_watcher_clone.as_ref(),
+                        Some(&watchdog_clone),
                         tok,
                     ).await {
                         warn!(error=?e, "handle_new_token (band-crossing route) failed");
@@ -837,10 +865,9 @@ Wallet `{}`  cap `{} SOL`",
         });
     }
 
-    // 🛡️ WATCHDOG (2026-05-20): spawn the session-level circuit breaker.
-    // Hooks (register_executed_buy / register_realized_pnl) are called from
-    // handle_new_token (after a successful entry) and from the copy-sell path.
-    let watchdog: Watchdog = Watchdog::spawn(cfg.watchdog.clone(), tg.clone());
+    // 🛡️ Watchdog already spawned above (before position-checker). Hooks
+    // (register_executed_buy / register_realized_pnl) wired into handle_new_token
+    // and check_positions exit path on 2026-05-22.
 
     // 🎯 COPY-TRADER V1 (2026-05-20): if enabled, spawn one polling task per
     // target wallet. Buy signals route through `handle_new_token` with
@@ -874,6 +901,7 @@ Wallet `{}`  cap `{} SOL`",
             let executor_c = executor.clone();
             let dev_watcher_c = dev_watcher.clone();
             let mcap_watcher_c = mcap_watcher.clone();
+            let watchdog_c = watchdog.clone();
             tokio::spawn(async move {
                 while let Some(sig) = buys_rx.recv().await {
                     info!(mint=%sig.mint, target=%sig.target_label, his_usd=sig.his_size_usd,
@@ -886,12 +914,14 @@ Wallet `{}`  cap `{} SOL`",
                     let executor = executor_c.clone();
                     let dev_watcher_clone = dev_watcher_c.clone();
                     let mcap_watcher_clone = mcap_watcher_c.clone();
+                    let watchdog_clone = watchdog_c.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_new_token(
                             &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
                             &symbol_cache, executor.as_ref(),
                             dev_watcher_clone.as_ref(),
                             mcap_watcher_clone.as_ref(),
+                            Some(&watchdog_clone),
                             tok,
                         ).await {
                             warn!(error=?e, "handle_new_token (copy-trade route) failed");
@@ -976,7 +1006,7 @@ Wallet `{}`  cap `{} SOL`",
     } else {
         debug!("copy_trader disabled or misconfigured — copy-trade route not spawned");
     }
-    // Suppress "unused" warnings until watchdog hooks are wired in callbacks.
+    // 2026-05-22: watchdog is now wired via handle_new_token + check_positions.
     let _ = &watchdog;
 
     info!("listening for new pump.fun launches");
@@ -989,12 +1019,14 @@ Wallet `{}`  cap `{} SOL`",
         let executor = executor.clone();
         let dev_watcher_clone = dev_watcher.clone();
         let mcap_watcher_clone = mcap_watcher.clone();
+        let watchdog_clone = watchdog.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_new_token(
                 &cfg, &db, &state, &tg, &jup, &curves, &curve_sub,
                 &symbol_cache, executor.as_ref(),
                 dev_watcher_clone.as_ref(),
                 mcap_watcher_clone.as_ref(),
+                Some(&watchdog_clone),
                 tok,
             ).await {
                 warn!(error=?e, "handle_new_token failed");
@@ -1016,6 +1048,7 @@ async fn handle_new_token(
     executor: Option<&Arc<Executor>>,
     dev_watcher: Option<&crate::dev_watcher::DevWatcher>,
     mcap_watcher: Option<&McapWatcher>,
+    watchdog: Option<&Watchdog>,
     tok: pumpportal::NewToken,
 ) -> Result<()> {
     // 🎯 COPY-TRADE OBSERVABILITY (2026-05-20): a copy-trade signal differs
@@ -1034,6 +1067,25 @@ async fn handle_new_token(
             target_pubkey = tok.copy_source_wallet.as_deref().unwrap_or("?"),
             "📥 copy-trade ENTRY ATTEMPT"
         );
+    } else if cfg.trading.copy_trade_only {
+        // 🚫 2026-05-22 Mamba: copy-trade-only mode. Reject every non-copy-trade
+        // entry route (scanner, livestream, mcap_watcher, trending_poller).
+        let _ = db.record_rejection(&tok.mint, "copy_trade_only_mode");
+        return Ok(());
+    }
+
+    // 🚫 2026-05-22 FIX: "already-held" gate. When a copy target scales into
+    // the same mint (multiple sequential buys), we used to fire a fresh entry
+    // each time — entering Bqwtwfm7 FIVE times in 3 minutes on 5/22. Now if
+    // we're already holding the mint, skip and let the existing position run.
+    {
+        let s = state.lock().await;
+        if s.open_positions.contains_key(&tok.mint) {
+            info!(mint=%tok.mint, filter="already_held",
+                  "🚧 entry skipped — already holding this mint");
+            let _ = db.record_rejection(&tok.mint, "already_held");
+            return Ok(());
+        }
     }
 
     // 🛡️ Phase 3 Feature.3: record EVERY observed launch against its dev
@@ -1236,8 +1288,13 @@ async fn handle_new_token(
         // First check if we already track it (another route subscribed earlier).
         let mut fetched = curves.get(&tok.mint).await;
         if fetched.is_none() {
+            // 2026-05-22 fix: bumped 3s→10s deadline. Fresh pump.fun mints
+            // often have bonding-curve PDA not yet propagated to Helius RPC
+            // at the moment we see the source-wallet's tx. Subscribe() also
+            // re-tries the on-chain fetch each call (see bonding_curve.rs).
             curve_sub.subscribe(vec![tok.mint.clone()]).await;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10000);
+            let mut retry_at = std::time::Instant::now() + std::time::Duration::from_millis(1000);
             while std::time::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 if let Some(c) = curves.get(&tok.mint).await {
@@ -1245,6 +1302,11 @@ async fn handle_new_token(
                         fetched = Some(c);
                         break;
                     }
+                }
+                // Re-trigger on-chain fetch every ~1s (it's the working path).
+                if std::time::Instant::now() >= retry_at {
+                    curve_sub.subscribe(vec![tok.mint.clone()]).await;
+                    retry_at = std::time::Instant::now() + std::time::Duration::from_millis(1000);
                 }
             }
         }
@@ -1256,7 +1318,7 @@ async fn handle_new_token(
             }
             _ => {
                 info!(mint=%tok.mint, filter="no_curve_state",
-                      "🚧 copy-trade FILTER reason=no_curve_state_after_subscribe — no WS trade tick within 3s");
+                      "🚧 copy-trade FILTER reason=no_curve_state_after_subscribe — no curve tick within 10s");
                 let _ = db.record_rejection(&tok.mint, "no_curve_state_after_subscribe");
                 state.lock().await.release_entry_reservation(&tok.mint);
                 return Ok(());
@@ -1605,6 +1667,11 @@ async fn handle_new_token(
         }
         let _ = s.save(&cfg.storage.state_path);
     }
+    // 2026-05-22 FIX: actually feed the watchdog so trade_count_cap +
+    // max_session_deploy_sol work. Previously this hook was never called.
+    if let Some(w) = watchdog {
+        w.register_executed_buy(cfg.trading.position_size_sol).await;
+    }
     info!(mint=%pos.mint, symbol=%pos.symbol, entry=pos.entry_price_usd, size=pos.size_usd, mode=%cfg.trading.mode, "🎯 entered position");
     if is_copy_trade {
         info!(
@@ -1747,6 +1814,7 @@ async fn check_positions(
     executor: Option<&Arc<Executor>>,
     pending_dev_dump_exits: &Mutex<HashSet<String>>,
     dev_watcher: Option<&crate::dev_watcher::DevWatcher>,
+    watchdog: Option<&Watchdog>,
 ) -> Result<()> {
     let mints: Vec<String> = {
         let s = state.lock().await;
@@ -1781,7 +1849,13 @@ async fn check_positions(
 
         let mcap_sol = curve.price_in_sol() * TOTAL_SUPPLY;
         let mcap_usd = mcap_sol * sol_usd;
-        let rug_triggered = if cfg.trading.rug_exit_mcap_usd > 0.0 {
+        // 🔧 2026-05-22: 5s grace period after entry before rug-collapse can fire.
+        // Pump.fun curves are noisy in the first few seconds (our own slippage +
+        // Theo's slippage + other copy-traders piling in). Without this guard
+        // every copy-trade entered at ≤$10k mcap auto-exited on first poll.
+        let secs_since_entry = (Utc::now() - pos.entered_at).num_seconds();
+        let rug_grace_ok = secs_since_entry >= 5;
+        let rug_triggered = rug_grace_ok && if cfg.trading.rug_exit_mcap_usd > 0.0 {
             mcap_usd < cfg.trading.rug_exit_mcap_usd
         } else if cfg.trading.rug_exit_mcap_sol > 0.0 {
             mcap_sol < cfg.trading.rug_exit_mcap_sol
@@ -1917,6 +1991,13 @@ async fn check_positions(
         let fees_usd = (cr.trade.fees_lamports as f64 / 1e9) * sol_usd;
         let net_usd = cr.trade.pnl_usd - fees_usd;
         let net_pct = if cr.trade.size_usd > 0.0 { (net_usd / cr.trade.size_usd) * 100.0 } else { 0.0 };
+        // 2026-05-22 FIX: actually feed the watchdog so loss_cap_sol works.
+        // Previously this hook was never called → realized_pnl_sol stayed 0 →
+        // watchdog never tripped despite our bankroll dropping below the floor.
+        if let Some(w) = watchdog {
+            let net_sol = if sol_usd > 0.0 { net_usd / sol_usd } else { 0.0 };
+            w.register_realized_pnl(net_sol).await;
+        }
         info!(
             mint=%cr.trade.mint,
             gross_pct=cr.trade.pnl_pct,

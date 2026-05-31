@@ -94,6 +94,11 @@ pub struct WatchdogCfg {
     #[serde(default = "default_watchdog_on_trip")] pub on_trip_action: String,
     /// Trip when cumulative deployed SOL (sum of entry sizes) exceeds this.
     #[serde(default = "default_watchdog_max_deploy")] pub max_session_deploy_sol: f64,
+    /// 🔒 Daily floor (USD). On STARTUP, bot refuses to launch if
+    /// trading+vault total < this. Survives restarts (state.json persists).
+    /// Prevents "watchdog tripped, reset, keep bleeding" loops.
+    /// Set to 0 to disable. Default: 0 (disabled). Mamba added 2026-05-22.
+    #[serde(default)] pub daily_floor_usd: f64,
 }
 
 fn default_watchdog_loss_cap() -> f64 { -0.02 }
@@ -111,6 +116,7 @@ impl Default for WatchdogCfg {
             trade_count_cap: default_watchdog_trade_cap(),
             on_trip_action: default_watchdog_on_trip(),
             max_session_deploy_sol: default_watchdog_max_deploy(),
+            daily_floor_usd: 0.0,
         }
     }
 }
@@ -316,6 +322,14 @@ pub struct Trading {
     /// Both leave a loud warning in the log. Default: TRUE in live mode.
     #[serde(default = "default_reconciliation_required")]
     pub reconciliation_required: bool,
+
+    /// 🚫 2026-05-22 Mamba: when true, reject every non-copy-trade entry. Only
+    /// signals originating from a watched copy-trade target wallet are allowed
+    /// to enter the buy path. Disables scanner/livestream/mcap_watcher/
+    /// trending_poller auto-entries (their config `enabled` flags should also
+    /// be set false to skip work; this is the final belt-and-suspenders gate).
+    #[serde(default)]
+    pub copy_trade_only: bool,
 
     /// SAFETY (Phase 3): max acceptable divergence between book total and chain total,
     /// as a fraction of the LARGER side. 0.05 = 5%. If chain or books are zero,
@@ -604,9 +618,8 @@ pub fn load(path: &str) -> Result<Config> {
 mod copy_trade_config_tests {
     use super::*;
 
-    /// 🎯 COPY-TRADE V1 (2026-05-20): assert the canonical config file parses
-    /// and that we wound up with EXACTLY 14 wallets (Brox dropped) plus the
-    /// watchdog values Mamba locked.
+    /// 🎯 COPY-TRADE V1 (2026-05-20 → 2026-05-22): assert the canonical config
+    /// file parses. THEO-ONLY MODE locked by Mamba 2026-05-22: 1 target.
     #[test]
     fn copy_trade_toml_parses_with_14_finalists_and_watchdog() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.copy-trade.toml");
@@ -614,22 +627,27 @@ mod copy_trade_config_tests {
         let cfg: Config = toml::from_str(&s).expect("parse config.copy-trade.toml");
 
         assert!(cfg.copy_trader.enabled, "copy_trader must be enabled");
-        assert_eq!(cfg.copy_trader.targets.len(), 14, "expected exactly 14 finalists (Brox dropped)");
+        // 2026-05-22 13:07 UTC: 3-wallet mode (Theo + Daumen + Jijo).
+        assert_eq!(cfg.copy_trader.targets.len(), 3, "3-wallet mode expects 3 targets");
+        let labels: Vec<&str> = cfg.copy_trader.targets.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"Theo"), "Theo must be in targets");
+        assert!(labels.contains(&"Daumen"), "Daumen must be in targets");
+        assert!(labels.contains(&"Jijo"), "Jijo must be in targets");
+        for t in &cfg.copy_trader.targets {
+            assert!(t.weight > 0.0, "weight must be > 0 for {}", t.label);
+        }
 
         // Verify Brox is NOT in the list.
         for t in &cfg.copy_trader.targets {
             assert_ne!(t.label, "Brox", "Brox must be dropped");
-            assert!(t.weight > 0.0, "weight should default to 1.0: {}", t.label);
         }
-        // Sample-check Gake is still present.
-        assert!(cfg.copy_trader.targets.iter().any(|t| t.label == "Gake"));
 
         assert!(cfg.watchdog.enabled, "watchdog must be enabled");
-        assert_eq!(cfg.watchdog.loss_cap_sol, -0.02);
-        // 🕒 Mamba bumped to 28800 (8h overnight) on 2026-05-21 — keep test in sync.
+        // 2026-05-22 15:45 Mamba: HARD $100 floor — anchor $112.66 - $12.66 = $100 / ~$87 SOL = 0.145 SOL.
+        assert!((cfg.watchdog.loss_cap_sol - (-0.145)).abs() < 1e-9);
         assert_eq!(cfg.watchdog.session_duration_secs, 28800);
         assert_eq!(cfg.watchdog.trade_count_cap, 20);
         assert_eq!(cfg.watchdog.on_trip_action, "hold");
-        assert!((cfg.watchdog.max_session_deploy_sol - 0.06).abs() < 1e-9);
+        assert!((cfg.watchdog.max_session_deploy_sol - 2.0).abs() < 1e-9);
     }
 }

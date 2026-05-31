@@ -1,0 +1,94 @@
+{
+  "sol_usd": 82.435,
+  "lookback_days": 30,
+  "results": [
+    {
+      "w": "AwyWtzDuZ1AUCqdrozocTWBtPFVc7mVFB98i5DKj4Lgh",
+      "bal": 1149.610732136,
+      "total_realized": 2654.2879081279852,
+      "mints": [
+        {
+          "mint": "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B",
+          "buy_sol": 368.6427222660089,
+          "sell_sol": 3022.9306303939943,
+          "realized_sol": 2654.2879081279852,
+          "n_buys": 1361,
+          "n_sells": 1113,
+          "first": 1779857250,
+          "last": 1780181026
+        }
+      ]
+    },
+    {
+      "w": "6Xo6FUK8PZcczgLSjyPKtSdnYzXVLtRjhpMEM5qrKYRD",
+      "bal": 1013.583070966,
+      "total_realized": 624.4087231980077,
+      "mints": [
+        {
+          "mint": "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B",
+          "buy_sol": 647.1695222259925,
+          "sell_sol": 1271.5782454240002,
+          "realized_sol": 624.4087231980077,
+          "n_buys": 1806,
+          "n_sells": 521,
+          "first": 1780045111,
+          "last": 1780181028
+        }
+      ]
+    },
+    {
+      "w": "4JMBYZvKTvExEcr7yJYEVRWsMjgunyFYNGYHYqQTqTbf",
+      "bal": 102.337858114,
+      "total_realized": 26.53267651600002,
+      "mints": [
+        {
+          "mint": "USAyjsvuR5A8YPTZy1vnG59soGWJgk6AzPWmeqX2k1B",
+          "buy_sol": 0.49499999999997807,
+          "sell_sol": 27.027676516,
+          "realized_sol": 26.53267651600002,
+          "n_buys": 2475,
+          "n_sells": 25,
+          "first": 1779359236,
+          "last": 1779509061
+        }
+      ]
+    },
+    {
+      "w": "3k8M1Q1m94NgXQ9R9dumDXm15ChzY4bjBGmxL7LuL9Ua",
+      "bal": 2.544254979,
+      "total_realized": -8.927617678999999,
+      "mints": [
+        {
+          "mint": "2PbhtFsuJeK3xL9XHYc2vcoDuD9DK6oD2X7ksRvEpump",
+          "buy_sol": 9.94257408,
+          "sell_sol": 4.726017441,
+          "realized_sol": -5.216556639,
+          "n_buys": 5,
+          "n_sells": 1,
+          "first": 1779922463,
+          "last": 1779922791
+        },
+        {
+          "mint": "3c1LSB3Tydbb3Cf9hisLPnk1hxsGjKsgw1mFZ8Hdpump",
+          "buy_sol": 4.18244816,
+          "sell_sol": 5.4738612,
+          "realized_sol": 1.2914130400000001,
+          "n_buys": 3,
+          "n_sells": 1,
+          "first": 1779915931,
+          "last": 1779916045
+        },
+        {
+          "mint": "DtbwH6VyLFTvEEuH4AXN2haXEj1dA6DhnMtCKK32pump",
+          "buy_sol": 5.002474079999999,
+          "sell_sol": 0.0,
+          "realized_sol": -5.002474079999999,
+          "n_buys": 4,
+          "n_sells": 0,
+          "first": 1779667131,
+          "last": 1779667705
+        }
+      ]
+    }
+  ]
+}

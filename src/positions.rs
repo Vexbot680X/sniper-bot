@@ -48,7 +48,12 @@ pub fn evaluate_exit(pos: &Position, current_price: f64) -> ExitDecision {
     if current_price <= pos.stop_loss_price {
         return ExitDecision { should_exit: true, reason: "stop_loss".into() };
     }
-    if now >= pos.max_hold_until {
+    // 2026-05-22 FIX: when max_hold_until is at-or-before entered_at, the
+    // user has disabled the timeout (max_hold_seconds=0 in config). The
+    // previous logic computed max_hold_until = now + 0s = now → timeout
+    // triggered on the very first position check (≤1s after entry). Now we
+    // only honor the timeout when it was set to a strictly future time.
+    if pos.max_hold_until > pos.entered_at && now >= pos.max_hold_until {
         return ExitDecision { should_exit: true, reason: "timeout".into() };
     }
     ExitDecision { should_exit: false, reason: String::new() }
@@ -121,6 +126,17 @@ pub fn open_position_paper(
         // Legacy zero-slippage path. Bit-for-bit equivalent to pre-simulator.
         size_usd / entry_price
     };
+    // 2026-05-22 FIX v2: bind entered_at and max_hold_until to the SAME
+    // instant. When max_hold_seconds=0, max_hold_until == entered_at and
+    // evaluate_exit's `max_hold_until > entered_at` guard correctly says
+    // "timeout disabled." Previous bug: separate `Utc::now()` calls put
+    // max_hold_until 1-100μs AFTER entered_at, making the guard always true.
+    let now = Utc::now();
+    let max_hold_until = if max_hold_seconds == 0 {
+        now  // exact same instant → evaluate_exit reads as "disabled"
+    } else {
+        now + Duration::seconds(max_hold_seconds as i64)
+    };
     let pos = Position {
         id: Uuid::new_v4().to_string(),
         mint: mint.clone(),
@@ -128,10 +144,10 @@ pub fn open_position_paper(
         entry_price_usd: entry_price,
         size_usd,
         tokens_held: tokens,
-        entered_at: Utc::now(),
+        entered_at: now,
         take_profit_price: entry_price * (1.0 + tp_pct / 100.0),
         stop_loss_price: entry_price * (1.0 - sl_pct / 100.0),
-        max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
+        max_hold_until,
         dev_pubkey,
         curve_sol_at_entry,
         entry_sig: None,            // paper mode — no on-chain entry
@@ -183,6 +199,14 @@ pub async fn open_position_live(
     let actual_sol_spent = fill.sol_spent_lamports as f64 / 1e9;
     let actual_size_usd = actual_sol_spent * sol_usd;
 
+    // 2026-05-22 FIX v2: same instant for entered_at & max_hold_until when
+    // max_hold_seconds=0 (see open_position_paper for full rationale).
+    let now = Utc::now();
+    let max_hold_until = if max_hold_seconds == 0 {
+        now
+    } else {
+        now + Duration::seconds(max_hold_seconds as i64)
+    };
     let pos = Position {
         id: Uuid::new_v4().to_string(),
         mint: mint.clone(),
@@ -190,10 +214,10 @@ pub async fn open_position_live(
         entry_price_usd: quoted_entry_price_usd,
         size_usd: actual_size_usd,
         tokens_held: tokens_human,
-        entered_at: Utc::now(),
+        entered_at: now,
         take_profit_price: quoted_entry_price_usd * (1.0 + tp_pct / 100.0),
         stop_loss_price: quoted_entry_price_usd * (1.0 - sl_pct / 100.0),
-        max_hold_until: Utc::now() + Duration::seconds(max_hold_seconds as i64),
+        max_hold_until,
         dev_pubkey,
         // Live mode uses the real executor for fills, not the paper simulator;
         // this field is informational only for live positions.
